@@ -230,20 +230,22 @@ classdef HospitalEnv < handle
                 return;
             end
 
-            % -- Lidar rays (reuse handles; update X/Y only) ----------
+            % -- Lidar hit dots (reuse handles; update X/Y only) -------
             for i = 1:numel(obj.Robots)
                 r = obj.Robots(i);
                 if isempty(r.LidarAngles)
                     continue;
                 end
-                [xray, yray] = obj.packLidarSegments(r);
+                [xDots, yDots] = obj.packLidarHitDots(r);
                 if i <= numel(obj.hLidar) && isvalid(obj.hLidar(i))
-                    set(obj.hLidar(i), 'XData', xray, 'YData', yray, ...
+                    set(obj.hLidar(i), 'XData', xDots, 'YData', yDots, ...
                         'Visible', obj.boolToOnOff(obj.LidarVisible));
                 else
-                    obj.hLidar(i) = line(obj.Ax, xray, yray, ...
-                        'Color', [0.35 0.85 0.35], ...
-                        'LineWidth', 0.35, ...
+                    obj.hLidar(i) = line(obj.Ax, xDots, yDots, ...
+                        'LineStyle', 'none', ...
+                        'Marker', '.', ...
+                        'MarkerSize', 7, ...
+                        'Color', [0.22 0.95 0.28], ...
                         'Visible', obj.boolToOnOff(obj.LidarVisible));
                 end
             end
@@ -417,8 +419,10 @@ classdef HospitalEnv < handle
 
         % ============================================================== %
         function buildDefaultObstacles(obj)
-            % 60 x 40 m double-loaded ward: patient rooms (north), main corridor,
-            % clinical block (south), lobby arch (east).  Rows: [cx,cy,hw,hh].
+            % 60 x 40 m ward: Row A (6 patient) / Hallway-1 / Row B (6 treatment) /
+            % vertical connector (x=28..32) / Hallway-2 / Row C (6 clinical) / Row D (2 support/admin).
+            % Path sanity: Hallway-1 (30,31) -> connector mouth y=29, y=22 -> Hallway-2 (30,20)
+            % -> ICU-A door y=18 -> bedside_ICUA_1; all door openings >= 1.5 m (assert >= 1.2 m).
             W = obj.Width; H = obj.Height;
             if abs(W - 60) > 1e-6 || abs(H - 40) > 1e-6
                 error('HospitalEnv:buildDefaultObstacles', ...
@@ -433,6 +437,14 @@ classdef HospitalEnv < handle
             innerB = tB;
             innerT = H - tB;
 
+            % --- Y-bands (metres) ---------------------------------------
+            yRowA0   = 33.00;   % patient wing (shortened)
+            yHall1_0 = 29.00;   % Hallway-1
+            yRowB0   = 22.00;   % treatment
+            yHall2_0 = 18.00;   % Hallway-2
+            yRowC0   = 10.00;   % clinical
+            yRowD0   = innerB; % support/admin floor
+
             borders = [
                 W/2,     tB/2,   W/2,     tB/2;
                 W/2, H - tB/2,   W/2,     tB/2;
@@ -440,120 +452,201 @@ classdef HospitalEnv < handle
                 W - tB/2, H/2,   tB/2,    H/2;
             ];
 
-            % Patient wing vertical dividers (x centres), y = 24 .. innerT
-            xv = (9.5:9:54.5)';
-            cyP = (24 + innerT) / 2;
-            hhP = (innerT - 24) / 2;
-            vertPatient = [xv, repmat(cyP, 6, 1), repmat(tt, 6, 1), repmat(hhP, 6, 1)];
+            % Row A verticals (x = 10..50), y = yRowA0 .. innerT
+            xvA = (10:10:50)';
+            cyA = (yRowA0 + innerT) / 2;
+            hhA = (innerT - yRowA0) / 2;
+            vertRowA = [xvA, repmat(cyA, 5, 1), repmat(tt, 5, 1), repmat(hhA, 5, 1)];
 
-            % Patient–corridor wall at y = 24 with door gaps (1.5 m each)
-            doorsTop = [
+            % Row B: left block dividers, right block dividers, connector sides
+            cyB = (yRowB0 + yHall1_0) / 2;
+            hhB = (yHall1_0 - yRowB0) / 2;
+            vertRowB_L = [9.5; 18.75];
+            vertRowB_R = [41.25; 50.5];
+            vertRowB_L = [vertRowB_L, repmat(cyB, 2, 1), repmat(tt, 2, 1), repmat(hhB, 2, 1)];
+            vertRowB_R = [vertRowB_R, repmat(cyB, 2, 1), repmat(tt, 2, 1), repmat(hhB, 2, 1)];
+            % Connector verticals: clear passage interior x in (28, 32)
+            vertConnL = [27.85, cyB, tt, hhB];
+            vertConnR = [32.15, cyB, tt, hhB];
+
+            % Row C verticals, y = yRowC0 .. yHall2_0
+            xvC = (10:10:50)';
+            cyC = (yRowC0 + yHall2_0) / 2;
+            hhC = (yHall2_0 - yRowC0) / 2;
+            vertRowC = [xvC, repmat(cyC, 5, 1), repmat(tt, 5, 1), repmat(hhC, 5, 1)];
+
+            % Row D single divider at x = 30
+            cyD = (yRowD0 + yRowC0) / 2;
+            hhD = (yRowC0 - yRowD0) / 2;
+            vertRowD = [30, cyD, tt, hhD];
+
+            % --- Horizontal walls (doors 1.5 m unless noted) ------------
+            doors_y33 = [
                 4.25,  5.75;
-                13.25, 14.75;
-                22.25, 23.75;
-                31.25, 32.75;
-                40.25, 41.75;
-                49.25, 50.75;
-                56.5,  58.0;
+                14.25, 15.75;
+                24.25, 25.75;
+                34.25, 35.75;
+                44.25, 45.75;
+                54.25, 55.75;
             ];
-            obj.assertDoorWidths(doorsTop, 1.2);
-            horizPatient = obj.horizontalWallSegments(24, innerL, innerR, doorsTop, tt);
+            obj.assertDoorWidths(doors_y33, 1.2);
+            horiz_y33 = obj.horizontalWallSegments(yRowA0, innerL, innerR, doors_y33, tt);
 
-            % Clinical block vertical dividers, y = innerB .. 18
-            xc = [14; 22; 30; 41; 52];
-            cyC = (innerB + 18) / 2;
-            hhC = (18 - innerB) / 2;
-            vertClinical = [xc, repmat(cyC, 5, 1), repmat(tt, 5, 1), repmat(hhC, 5, 1)];
-
-            % Clinical–corridor wall at y = 18; lobby arch open for x >= 52
-            doorsClinical = [
-                5.25,  6.75;
-                17.25, 18.75;
-                25.25, 26.75;
-                34.75, 36.25;
-                45.75, 47.25;
+            % Hallway-1 / Row B: room doors + 4 m connector mouth
+            doors_y29 = [
+                4.125,  5.625;
+                13.375, 14.875;
+                22.625, 24.125;
+                28.00,  32.00;
+                35.875, 37.375;
+                45.125, 46.625;
+                54.375, 55.875;
             ];
-            obj.assertDoorWidths(doorsClinical, 1.2);
-            xWallEnd = 52; % open arch / lobby connection for x > 52
-            horizClinical = obj.horizontalWallSegments(18, innerL, xWallEnd, doorsClinical, tt);
+            obj.assertDoorWidths(doors_y29, 1.2);
+            horiz_y29 = obj.horizontalWallSegments(yHall1_0, innerL, innerR, doors_y29, tt);
 
-            obj.WallObstacles = [borders; vertPatient; horizPatient; vertClinical; horizClinical];
+            % Row B / Hallway-2: solid except connector mouth
+            doors_y22 = [28.00, 32.00];
+            obj.assertDoorWidths(doors_y22, 1.2);
+            horiz_y22 = obj.horizontalWallSegments(yRowB0, innerL, innerR, doors_y22, tt);
 
-            % Beds (distinct render colour)
+            doors_y18 = doors_y33; % same centres as Row A doors
+            obj.assertDoorWidths(doors_y18, 1.2);
+            horiz_y18 = obj.horizontalWallSegments(yHall2_0, innerL, innerR, doors_y18, tt);
+
+            doors_y10 = [
+                14.25, 15.75;
+                44.25, 45.75;
+            ];
+            obj.assertDoorWidths(doors_y10, 1.2);
+            horiz_y10 = obj.horizontalWallSegments(yRowC0, innerL, innerR, doors_y10, tt);
+
+            obj.WallObstacles = [borders; vertRowA; vertRowB_L; vertRowB_R; vertConnL; vertConnR; ...
+                vertRowC; vertRowD; horiz_y33; horiz_y29; horiz_y22; horiz_y18; horiz_y10];
+
+            % --- Beds ---------------------------------------------------
             bedHW = 1.2; bedHH = 0.5;
-            patCx = (5:9:50)';
+            patCx = (5:10:55)';
             patientBeds = [patCx, repmat(38.5, 6, 1), repmat(bedHW, 6, 1), repmat(bedHH, 6, 1)];
-            examBed = [57, 38.5, 1.0, 0.6];
-            icuCx = [34; 38; 45; 49];
-            icuBeds = [icuCx, repmat(2.5, 4, 1), repmat(0.6, 4, 1), repmat(1.2, 4, 1)];
-            obj.BedObstacles = [patientBeds; examBed; icuBeds];
+            examTableB = [55, 24.5, 1.0, 0.6];
+            orTableB   = [35, 24.5, 1.0, 0.6];
+            icuA_cx = [32.5; 37.5];
+            icuB_cx = [39.5; 43.5];
+            icuBeds = [icuA_cx, repmat(13.5, 2, 1), repmat(0.6, 2, 1), repmat(1.2, 2, 1); ...
+                       icuB_cx, repmat(13.5, 2, 1), repmat(0.6, 2, 1), repmat(1.2, 2, 1)];
+            erBed = [55, 13.5, 1.0, 0.6];
+            obj.BedObstacles = [patientBeds; examTableB; orTableB; icuBeds; erBed];
 
-            % Furniture / benches (collision + render)
-            counter   = [7.25, 15.5, 4.0, 0.5];
-            pharmShel = [18,   14,   2.0, 0.5];
-            suppShel  = [26,   14,   2.0, 0.5];
-            bench1    = [55.75, 10,   2.0, 0.35];
-            bench2    = [55.75, 6,    2.0, 0.35];
-            obj.FurnitureObstacles = [counter; pharmShel; suppShel; bench1; bench2];
+            % --- Furniture ----------------------------------------------
+            labBench   = [5,   27.0, 1.5, 0.5];
+            radScan    = [15,  24.5, 1.0, 0.8];
+            counter    = [5,   11.5, 4.0, 0.5];
+            pharmShel  = [15,  11.5, 2.5, 0.5];
+            suppShel   = [25,  11.5, 2.5, 0.5];
+            adminDeskW = [15,  6.0,  2.0, 0.35];
+            adminDeskE = [45,  6.0,  2.0, 0.35];
+            obj.FurnitureObstacles = [labBench; radScan; counter; pharmShel; suppShel; adminDeskW; adminDeskE];
 
             obj.Obstacles = [obj.WallObstacles; obj.BedObstacles; obj.FurnitureObstacles];
         end
 
         % ============================================================== %
         function buildRooms(obj)
-            cPatient  = [0.10 0.18 0.30];
-            cICU      = [0.30 0.12 0.12];
-            cNurse    = [0.10 0.28 0.18];
-            cPharm    = [0.30 0.24 0.10];
-            cSupply   = [0.18 0.20 0.28];
-            cLobby    = [0.14 0.14 0.18];
-            cCorridor = [0.11 0.12 0.16];
+            cPatient   = [0.10 0.18 0.30];
+            cTreatment = [0.10 0.24 0.30];
+            cICU       = [0.30 0.12 0.12];
+            cNurse     = [0.10 0.28 0.18];
+            cPharm     = [0.30 0.24 0.10];
+            cSupply    = [0.18 0.20 0.28];
+            cSupport   = [0.16 0.16 0.22];
+            cCorridor  = [0.11 0.12 0.16];
+            cER        = [0.32 0.16 0.12];
 
             R = struct('name',{},'type',{},'xmin',{},'xmax',{},'ymin',{},'ymax',{}, ...
                 'floorColor',{},'labelX',{},'labelY',{});
+
+            % Row A — 6 patient rooms (interior flush to walls at x = 10,20,...,50)
             R(end+1) = struct('name','P101','type','patient', ...
-                'xmin',0.25,'xmax',9.35,'ymin',24,'ymax',39.75, ...
-                'floorColor',cPatient,'labelX',5,'labelY',36.5);
+                'xmin',0.25,'xmax',9.85,'ymin',33,'ymax',39.75, ...
+                'floorColor',cPatient,'labelX',5.05,'labelY',37.5);
             R(end+1) = struct('name','P102','type','patient', ...
-                'xmin',9.65,'xmax',18.35,'ymin',24,'ymax',39.75, ...
-                'floorColor',cPatient,'labelX',14,'labelY',36.5);
+                'xmin',10.15,'xmax',19.85,'ymin',33,'ymax',39.75, ...
+                'floorColor',cPatient,'labelX',15,'labelY',37.5);
             R(end+1) = struct('name','P103','type','patient', ...
-                'xmin',18.65,'xmax',27.35,'ymin',24,'ymax',39.75, ...
-                'floorColor',cPatient,'labelX',23,'labelY',36.5);
+                'xmin',20.15,'xmax',29.85,'ymin',33,'ymax',39.75, ...
+                'floorColor',cPatient,'labelX',25,'labelY',37.5);
             R(end+1) = struct('name','P104','type','patient', ...
-                'xmin',27.65,'xmax',36.35,'ymin',24,'ymax',39.75, ...
-                'floorColor',cPatient,'labelX',32,'labelY',36.5);
+                'xmin',30.15,'xmax',39.85,'ymin',33,'ymax',39.75, ...
+                'floorColor',cPatient,'labelX',35,'labelY',37.5);
             R(end+1) = struct('name','P105','type','patient', ...
-                'xmin',36.65,'xmax',45.35,'ymin',24,'ymax',39.75, ...
-                'floorColor',cPatient,'labelX',41,'labelY',36.5);
+                'xmin',40.15,'xmax',49.85,'ymin',33,'ymax',39.75, ...
+                'floorColor',cPatient,'labelX',45,'labelY',37.5);
             R(end+1) = struct('name','P106','type','patient', ...
-                'xmin',45.65,'xmax',54.35,'ymin',24,'ymax',39.75, ...
-                'floorColor',cPatient,'labelX',50,'labelY',36.5);
-            R(end+1) = struct('name','EXAM','type','patient', ...
-                'xmin',54.65,'xmax',59.75,'ymin',24,'ymax',39.75, ...
-                'floorColor',cPatient,'labelX',57,'labelY',36.5);
-            R(end+1) = struct('name','Corridor','type','corridor', ...
-                'xmin',0.25,'xmax',59.75,'ymin',18,'ymax',24, ...
-                'floorColor',cCorridor,'labelX',30,'labelY',21);
-            R(end+1) = struct('name','Nurse Station','type','nurse', ...
-                'xmin',0.25,'xmax',13.85,'ymin',0.25,'ymax',17.85, ...
-                'floorColor',cNurse,'labelX',7,'labelY',10);
-            R(end+1) = struct('name','Pharmacy','type','pharmacy', ...
-                'xmin',14.15,'xmax',21.85,'ymin',0.25,'ymax',17.85, ...
-                'floorColor',cPharm,'labelX',18,'labelY',10);
-            R(end+1) = struct('name','Supply','type','supply', ...
-                'xmin',22.15,'xmax',29.85,'ymin',0.25,'ymax',17.85, ...
-                'floorColor',cSupply,'labelX',26,'labelY',10);
+                'xmin',50.15,'xmax',59.75,'ymin',33,'ymax',39.75, ...
+                'floorColor',cPatient,'labelX',55,'labelY',37.5);
+
+            R(end+1) = struct('name','Hallway-1','type','corridor', ...
+                'xmin',0.25,'xmax',59.75,'ymin',29,'ymax',33, ...
+                'floorColor',cCorridor,'labelX',8,'labelY',31);
+            R(end+1) = struct('name','Hallway-2','type','corridor', ...
+                'xmin',0.25,'xmax',59.75,'ymin',18,'ymax',22, ...
+                'floorColor',cCorridor,'labelX',8,'labelY',20);
+
+            % Row B — treatment (6) + connector strip (walls at 9.5, 18.75, 27.85 / 32.15, 41.25, 50.5)
+            R(end+1) = struct('name','LAB','type','treatment', ...
+                'xmin',0.25,'xmax',9.35,'ymin',22,'ymax',29, ...
+                'floorColor',cTreatment,'labelX',4.8,'labelY',25.5);
+            R(end+1) = struct('name','RAD','type','treatment', ...
+                'xmin',9.65,'xmax',18.60,'ymin',22,'ymax',29, ...
+                'floorColor',cTreatment,'labelX',14.1,'labelY',25.5);
+            R(end+1) = struct('name','PT','type','treatment', ...
+                'xmin',18.90,'xmax',27.85,'ymin',22,'ymax',29, ...
+                'floorColor',cTreatment,'labelX',23.4,'labelY',25.5);
+            R(end+1) = struct('name','Connector','type','connector', ...
+                'xmin',28.15,'xmax',31.85,'ymin',22,'ymax',29, ...
+                'floorColor',cCorridor,'labelX',30,'labelY',25.5);
+            R(end+1) = struct('name','OR','type','treatment', ...
+                'xmin',32.15,'xmax',41.10,'ymin',22,'ymax',29, ...
+                'floorColor',cTreatment,'labelX',36.6,'labelY',25.5);
+            R(end+1) = struct('name','RECOVERY','type','treatment', ...
+                'xmin',41.40,'xmax',50.35,'ymin',22,'ymax',29, ...
+                'floorColor',cTreatment,'labelX',45.9,'labelY',25.5);
+            R(end+1) = struct('name','EXAM','type','treatment', ...
+                'xmin',50.65,'xmax',59.75,'ymin',22,'ymax',29, ...
+                'floorColor',cTreatment,'labelX',55.2,'labelY',25.5);
+
+            % Row C — clinical (6), walls at x = 10..50
+            R(end+1) = struct('name','NURSE','type','nurse', ...
+                'xmin',0.25,'xmax',9.85,'ymin',10,'ymax',18, ...
+                'floorColor',cNurse,'labelX',5.05,'labelY',14);
+            R(end+1) = struct('name','PHARMACY','type','pharmacy', ...
+                'xmin',10.15,'xmax',19.85,'ymin',10,'ymax',18, ...
+                'floorColor',cPharm,'labelX',15,'labelY',14);
+            R(end+1) = struct('name','SUPPLY','type','supply', ...
+                'xmin',20.15,'xmax',29.85,'ymin',10,'ymax',18, ...
+                'floorColor',cSupply,'labelX',25,'labelY',14);
             R(end+1) = struct('name','ICU-A','type','icu', ...
-                'xmin',30.15,'xmax',40.85,'ymin',0.25,'ymax',17.85, ...
-                'floorColor',cICU,'labelX',35.5,'labelY',10);
+                'xmin',30.15,'xmax',39.85,'ymin',10,'ymax',18, ...
+                'floorColor',cICU,'labelX',35,'labelY',14);
             R(end+1) = struct('name','ICU-B','type','icu', ...
-                'xmin',41.15,'xmax',51.85,'ymin',0.25,'ymax',17.85, ...
-                'floorColor',cICU,'labelX',46.5,'labelY',10);
-            R(end+1) = struct('name','Lobby','type','lobby', ...
-                'xmin',52.15,'xmax',59.75,'ymin',0.25,'ymax',23.8, ...
-                'floorColor',cLobby,'labelX',56,'labelY',12);
+                'xmin',40.15,'xmax',49.85,'ymin',10,'ymax',18, ...
+                'floorColor',cICU,'labelX',45,'labelY',14);
+            R(end+1) = struct('name','ER','type','er', ...
+                'xmin',50.15,'xmax',59.75,'ymin',10,'ymax',18, ...
+                'floorColor',cER,'labelX',55,'labelY',14);
+
+            % Row D — support/admin (2), wall at x = 30
+            R(end+1) = struct('name','ADMIN-W','type','support', ...
+                'xmin',0.25,'xmax',29.85,'ymin',0.25,'ymax',10, ...
+                'floorColor',cSupport,'labelX',15,'labelY',5);
+            R(end+1) = struct('name','ADMIN-E','type','support', ...
+                'xmin',30.15,'xmax',59.75,'ymin',0.25,'ymax',10, ...
+                'floorColor',cSupport,'labelX',45,'labelY',5);
+
             obj.Rooms = R;
+            nReal = sum(~ismember({obj.Rooms.type}, {'corridor', 'connector'}));
+            assert(nReal == 20, 'HospitalEnv:buildRooms', ...
+                'Expected 20 clinical/patient rooms, got %d.', nReal);
         end
 
         % ============================================================== %
@@ -561,16 +654,28 @@ classdef HospitalEnv < handle
             % Delivery targets + nurse tour stops (world frame, metres).
             names = { ...
                 'bedside_P101'; 'bedside_P102'; 'bedside_P103'; 'bedside_P104'; ...
-                'bedside_P105'; 'bedside_P106'; 'exam_table'; ...
+                'bedside_P105'; 'bedside_P106'; ...
                 'bedside_ICUA_1'; 'bedside_ICUA_2'; 'bedside_ICUB_1'; 'bedside_ICUB_2'; ...
-                'pharmacy_pickup'; 'supply_pickup'; 'nurse_desk'; 'corridor_mid' };
-            xs = [5; 14; 23; 32; 41; 50; 57; 34; 38; 45; 49; 18; 26; 7.25; 30];
-            ys = [37; 37; 37; 37; 37; 37; 36.5; 4; 4; 4; 4; 12; 12; 13.5; 21];
-            rms = { 'P101'; 'P102'; 'P103'; 'P104'; 'P105'; 'P106'; 'EXAM'; ...
-                'ICU-A'; 'ICU-A'; 'ICU-B'; 'ICU-B'; 'Pharmacy'; 'Supply'; ...
-                'Nurse Station'; 'Corridor' };
-            tt  = [true(7,1); true(4,1); true(2,1); false; false];
-            ns  = true(15,1);
+                'lab_pickup'; 'rad_table'; 'pt_station'; 'or_table'; 'recovery_bed'; 'exam_table'; ...
+                'pharmacy_pickup'; 'supply_pickup'; 'er_bay'; ...
+                'nurse_desk'; 'corridor1_mid'; 'corridor2_mid' };
+            xs = [5; 15; 25; 35; 45; 55; ...
+                32.5; 37.5; 39.5; 43.5; ...
+                5; 15; 25; 35; 45; 55; ...
+                15; 25; 55; ...
+                5; 30; 30];
+            ys = [36; 36; 36; 36; 36; 36; ...
+                15.5; 15.5; 15.5; 15.5; ...
+                26; 25.5; 25.5; 25.5; 25.5; 25.5; ...
+                12.5; 12.5; 12.5; ...
+                12.5; 31; 20];
+            rms = { 'P101'; 'P102'; 'P103'; 'P104'; 'P105'; 'P106'; ...
+                'ICU-A'; 'ICU-A'; 'ICU-B'; 'ICU-B'; ...
+                'LAB'; 'RAD'; 'PT'; 'OR'; 'RECOVERY'; 'EXAM'; ...
+                'PHARMACY'; 'SUPPLY'; 'ER'; ...
+                'NURSE'; 'Hallway-1'; 'Hallway-2' };
+            tt = [true(19,1); false(3,1)];
+            ns = true(22,1);
 
             p = repmat(struct('id',0,'name','','x',0,'y',0,'roomName','', ...
                 'taskTarget',false,'nurseStop',false), numel(names), 1);
@@ -615,8 +720,8 @@ classdef HospitalEnv < handle
             obj.hRoomFloors = gobjects(nR, 1);
             for ri = 1:nR
                 Rm = obj.Rooms(ri);
-                if strcmp(Rm.type, 'corridor')
-                    fa = 0.10; % subtle corridor tint
+                if strcmp(Rm.type, 'corridor') || strcmp(Rm.type, 'connector')
+                    fa = 0.10; % subtle corridor / connector tint
                 else
                     fa = 0.28;
                 end
@@ -916,23 +1021,26 @@ classdef HospitalEnv < handle
         end
 
         % ============================================================== %
-        function [xray, yray] = packLidarSegments(~, robot)
+        function [xDots, yDots] = packLidarHitDots(~, robot)
             n = numel(robot.LidarRanges);
-            xray = nan(1, 3*n);
-            yray = nan(1, 3*n);
+            xDots = nan(1, n);
+            yDots = nan(1, n);
             if n == 0
                 return;
             end
 
-            endX = robot.X + robot.LidarRanges .* cos(robot.LidarAngles + robot.Theta);
-            endY = robot.Y + robot.LidarRanges .* sin(robot.LidarAngles + robot.Theta);
+            epsTol = 1e-3;
+            hitMask = robot.LidarRanges < (robot.MaxRange - epsTol);
+            if ~any(hitMask)
+                return;
+            end
 
-            idx0 = 1:3:(3*n);
-            idx1 = 2:3:(3*n);
-            xray(idx0) = robot.X;
-            xray(idx1) = endX;
-            yray(idx0) = robot.Y;
-            yray(idx1) = endY;
+            worldAngles = robot.LidarAngles + robot.Theta;
+            hitX = robot.X + robot.LidarRanges .* cos(worldAngles);
+            hitY = robot.Y + robot.LidarRanges .* sin(worldAngles);
+
+            xDots(hitMask) = hitX(hitMask);
+            yDots(hitMask) = hitY(hitMask);
         end
 
         % ============================================================== %

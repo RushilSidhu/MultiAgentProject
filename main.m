@@ -205,6 +205,58 @@ function positions = safeRandomPositions(n, env, minClearance, regionAABB)
     end
 end
 
+function positions = safeRandomPositionsMulti(n, env, minClearance, regionList)
+    % Sample n positions by repeatedly picking a random region from regionList (cell of 1x4 AABBs).
+    positions = zeros(n, 2);
+    if n == 0
+        return;
+    end
+    margin = minClearance + 0.5;
+    W = env.Width; H = env.Height;
+    regionList = regionList(:);
+    placed = 0;
+    maxAttempts = 25000;
+    attempts = 0;
+    while placed < n && attempts < maxAttempts
+        attempts = attempts + 1;
+        reg = regionList{randi(numel(regionList))};
+        rcx = reg(1); rcy = reg(2); rhw = reg(3); rhh = reg(4);
+        xMin = max(margin, rcx - rhw);
+        xMax = min(W - margin, rcx + rhw);
+        yMin = max(margin, rcy - rhh);
+        yMax = min(H - margin, rcy + rhh);
+        if xMax <= xMin || yMax <= yMin
+            continue;
+        end
+        x = xMin + rand() * (xMax - xMin);
+        y = yMin + rand() * (yMax - yMin);
+        clearOfObs = true;
+        for w = 1:size(env.Obstacles, 1)
+            obs = env.Obstacles(w, :);
+            dx = abs(x - obs(1)); dy = abs(y - obs(2));
+            hw = obs(3);          hh = obs(4);
+            if dx < hw + minClearance && dy < hh + minClearance
+                clearOfObs = false; break;
+            end
+        end
+        if ~clearOfObs, continue; end
+        clearOfOthers = true;
+        for j = 1:placed
+            if norm([x - positions(j, 1), y - positions(j, 2)]) < 2 * minClearance
+                clearOfOthers = false; break;
+            end
+        end
+        if ~clearOfOthers, continue; end
+        placed = placed + 1;
+        positions(placed, :) = [x, y];
+    end
+    if placed < n
+        warning('main:placement', ...
+            'Could only place %d/%d entities safely (multi-region); world may be overcrowded.', ...
+            placed, n);
+    end
+end
+
 function result = runSingleExperiment(strategyCfg, seed, simCfg)
     % Build a fresh simulation instance for one (strategy, seed) pair.
     rng(seed, 'twister');
@@ -216,10 +268,13 @@ function result = runSingleExperiment(strategyCfg, seed, simCfg)
         env.addSpeedControl(simCfg.INITIAL_SPEED, simCfg.SPEED_MIN, simCfg.SPEED_MAX);
     end
 
-    % Robots start in the main corridor strip (clear of room furniture).
-    robotRegion = [30, 21, 28.5, 2.8];  % [cx, cy, halfW, halfH] in metres
-    robotStartPositions = safeRandomPositions(simCfg.N_ROBOTS, env, ...
-        simCfg.ROBOT_RADIUS + 0.5, robotRegion);
+    % Robots start in Hallway-2 (primary) or Hallway-1 (fallback) — clear of furniture.
+    robotRegions = {
+        [30, 20, 28.5, 1.8];   % Hallway-2
+        [30, 31, 28.5, 1.8]    % Hallway-1
+    };
+    robotStartPositions = safeRandomPositionsMulti(simCfg.N_ROBOTS, env, ...
+        simCfg.ROBOT_RADIUS + 0.5, robotRegions);
     for i = 1:simCfg.N_ROBOTS
         initTheta = rand() * 2 * pi;
         r = RobotAgent(robotStartPositions(i,1), robotStartPositions(i,2), ...
@@ -233,13 +288,13 @@ function result = runSingleExperiment(strategyCfg, seed, simCfg)
         env.addRobot(r);
     end
 
-    % Nurses: corridor + lobby / clinical circulation (avoids spawning inside beds).
+    % Nurses: weighted Hallway-1 / Hallway-2 / support/admin floor (Row D).
     nN = simCfg.N_NURSES + simCfg.N_CART_NURSES;
-    nCor = ceil(0.55 * nN);
-    nLob = nN - nCor;
-    nurseCorridor = safeRandomPositions(nCor, env, 0.6, [30, 21, 28.5, 2.8]);
-    nurseLobby = safeRandomPositions(nLob, env, 0.6, [56, 10, 2.8, 8.5]);
-    nursePositions = [nurseCorridor; nurseLobby];
+    nurseRegions = [
+        repmat({[30, 31, 28.5, 1.8]}, 6, 1);   % 60% Hallway-1
+        repmat({[30, 20, 28.5, 1.8]}, 4, 1)    % 40% Hallway-2
+    ];
+    nursePositions = safeRandomPositionsMulti(nN, env, 0.6, nurseRegions);
     nursePositions = nursePositions(randperm(nN), :);
     for k = 1:simCfg.N_NURSES
         env.addNurse(NurseAgent(nursePositions(k,1), nursePositions(k,2), false));

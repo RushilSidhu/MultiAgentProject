@@ -12,7 +12,7 @@ any simulation infrastructure.
 | File | Role |
 |---|---|
 | `main.m` | Entry-point. Configuration lives here. |
-| `HospitalEnv.m` | 60×40 m ward layout (walls, rooms, POIs), entity registry, renderer, collision, metrics. |
+| `HospitalEnv.m` | 60×40 m ward (20 rooms, 2 hallways, vertical connector), walls, POIs, renderer, collision, metrics. |
 | `RobotAgent.m` | Unicycle-model robot with 2-D Lidar sensor and pluggable controller. |
 | `NurseAgent.m` | Waypoint / random walk (plain nurse or nurse+cart); optional semantic `Waypoints` from env. |
 | `TaskDispatcher.m` | Normally-distributed task spawner with optional batch arrivals. |
@@ -143,11 +143,23 @@ TASK_BATCH_PROB    = 0.10;
 
 ## Ward layout and custom geometry
 
-The default floor plan is a **60 m × 40 m** double-loaded ward (patient rooms
-north, main corridor, clinical rooms south, lobby east). `buildDefaultObstacles()`
-requires `Width == 60` and `Height == 40`. It fills `WallObstacles`, `BedObstacles`,
-and `FurnitureObstacles`, then concatenates them into `obj.Obstacles` (each row
-`[centre_x, centre_y, half_width, half_height]`).
+The default floor plan is a **60 m × 40 m** layout with **20 rooms**, **two
+horizontal hallways** (Hallway-1 and Hallway-2), and a **vertical connector**
+(`x ≈ 28–32 m`) between them through the treatment wing. From north to south:
+
+1. **Row A** — six patient rooms (P101–P106), shortened depth (~6.75 m).
+2. **Hallway-1** — 4 m band at `y ≈ 29–33`.
+3. **Row B** — six treatment rooms (LAB, RAD, PT, OR, RECOVERY, EXAM) split left
+   and right of the connector.
+4. **Hallway-2** — 4 m band at `y ≈ 18–22`.
+5. **Row C** — six clinical rooms (NURSE, PHARMACY, SUPPLY, ICU-A, ICU-B, ER).
+6. **Row D** — two support/admin bays (ADMIN-W, ADMIN-E).
+
+`buildDefaultObstacles()` requires `Width == 60` and `Height == 40`. It fills
+`WallObstacles`, `BedObstacles`, and `FurnitureObstacles`, then concatenates them
+into `obj.Obstacles` (each row `[centre_x, centre_y, half_width, half_height]`).
+Door openings are at least **1.2 m** wide (typically **1.5 m**); the connector
+mouth is **4 m** wide.
 
 Semantic delivery sites live in `buildPOIs()`; `spawnTask()` samples from POIs
 marked `taskTarget`. To add a new pickup point, extend `buildPOIs()` and (if
