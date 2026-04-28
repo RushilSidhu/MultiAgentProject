@@ -93,7 +93,7 @@ const nominalTargetCommand = (
   observation: RobotObservation,
   target: Vec2,
   distToTarget: number,
-  avoidGain = 1.25,
+  avoidGain = 0.7,
 ): RobotAction => {
   const routeTarget = navigationWaypoint(
     observation.self.position,
@@ -101,7 +101,7 @@ const nominalTargetCommand = (
     observation.self.radius,
     observation.staticObstacles,
     observation.scenario,
-    0.12,
+    0.06,
   );
   const desired = {
     x: routeTarget.x - observation.self.position.x,
@@ -110,19 +110,19 @@ const nominalTargetCommand = (
   const desiredMag = Math.max(0.001, Math.hypot(desired.x, desired.y));
   const avoid = steerAwayFromObstacles(observation.self.position, observation.staticObstacles, avoidGain);
   const headingVector = {
-    x: desired.x / desiredMag + avoid.x * 1.35,
-    y: desired.y / desiredMag + avoid.y * 1.35,
+    x: desired.x / desiredMag + avoid.x * 0.4,
+    y: desired.y / desiredMag + avoid.y * 0.4,
   };
   const heading = Math.atan2(headingVector.y, headingVector.x);
   const headingError = normalizeAngle(heading - observation.self.theta);
-  const alignment = Math.max(0, Math.cos(headingError));
+  const alignment = Math.max(0.15, Math.cos(headingError));
   const waypointDistance = distance(observation.self.position, routeTarget);
-  const speed = Math.min(observation.self.maxSpeed, distToTarget / 2, Math.max(0.2, waypointDistance) / 1.4) * alignment;
+  const speed = Math.min(observation.self.maxSpeed, distToTarget / 2, Math.max(0.35, waypointDistance) / 1.2) * alignment;
 
   return {
     kind: 'velocity',
     linear: speed,
-    angular: clamp(headingError * 2.2, -2.6, 2.6),
+    angular: clamp(headingError * 2.6, -2.6, 2.6),
     note: 'Tracking task target with local obstacle steering',
   };
 };
@@ -164,9 +164,11 @@ export class SocialForcePolicy implements RobotPolicy {
     for (const staff of observation.sensedStaff) addAgentRepulsion(staff.position, staff.radius, 6.0, 0.65);
     for (const robot of observation.sensedRobots) addAgentRepulsion(robot.position, robot.radius, 2.4, 0.4);
 
-    const wallRepulsion = steerAwayFromObstacles(self.position, observation.staticObstacles, 2.8);
-    forceX += wallRepulsion.x * 2.0;
-    forceY += wallRepulsion.y * 2.0;
+    const isPickup = task.status === 'assigned';
+    const wallRepulsion = steerAwayFromObstacles(self.position, observation.staticObstacles, isPickup ? 1.0 : 1.4);
+    const wallMult = isPickup ? 0.5 : 0.9;
+    forceX += wallRepulsion.x * wallMult;
+    forceY += wallRepulsion.y * wallMult;
 
     const linear = clamp(forceX * heading.x + forceY * heading.y, 0, self.maxSpeed);
     const angular = clamp((forceX * -heading.y + forceY * heading.x) * 2.0, -2.8, 2.8);
@@ -188,7 +190,8 @@ export class ControlBarrierPolicy implements RobotPolicy {
     const context = prepareTaskContext(observation);
     if ('kind' in context) return context;
 
-    const nominal = nominalTargetCommand(observation, context.target, context.distToTarget);
+    const isPickup = context.task.status === 'assigned';
+    const nominal = nominalTargetCommand(observation, context.target, context.distToTarget, isPickup ? 0.4 : 0.7);
     if (nominal.kind !== 'velocity') return nominal;
 
     const { self } = observation;
@@ -213,10 +216,13 @@ export class ControlBarrierPolicy implements RobotPolicy {
     };
 
     for (const staff of observation.sensedStaff) addBarrier(staff.position, staff.radius, agentVelocity(staff), 0.65, 1.7);
-    for (const robot of observation.sensedRobots) addBarrier(robot.position, robot.radius, { x: 0, y: 0 }, 0.35, 2.2);
+    for (const robot of observation.sensedRobots) addBarrier(robot.position, robot.radius, { x: 0, y: 0 }, 0.65, 4.5);
+    const wallBuffer = isPickup ? 0.02 : 0.1;
+    const wallGamma = isPickup ? 1.5 : 2.0;
+    const wallTrigger = isPickup ? 1.4 : 1.8;
     for (const rect of observation.staticObstacles) {
       const point = closestPointOnRect(self.position, rect);
-      if (distance(point, self.position) < 2.4) addBarrier(point, 0.12, { x: 0, y: 0 }, 0.2, 3.4);
+      if (distance(point, self.position) < wallTrigger) addBarrier(point, 0.12, { x: 0, y: 0 }, wallBuffer, wallGamma);
     }
 
     const linear = minLinear > maxLinear ? 0 : clamp(nominal.linear, minLinear, maxLinear);
@@ -236,6 +242,7 @@ export class PredictiveMpcPolicy implements RobotPolicy {
     const context = prepareTaskContext(observation);
     if ('kind' in context) return context;
 
+    const isPickup = context.task.status === 'assigned';
     const { self } = observation;
     const routeTarget = navigationWaypoint(self.position, context.target, self.radius, observation.staticObstacles, observation.scenario, 0.12);
     const horizon = 8;
@@ -243,11 +250,12 @@ export class PredictiveMpcPolicy implements RobotPolicy {
     const linearSamples = [0, 0.25, 0.5, 0.75, 1.0].map((scale) => scale * self.maxSpeed);
     const angularSamples = [-2.2, -1.1, -0.35, 0, 0.35, 1.1, 2.2];
     let best: { linear: number; angular: number; cost: number } | undefined;
+    const staticClearance = isPickup ? 0.03 : 0.06;
 
     for (const linear of linearSamples) {
       for (const angular of angularSamples) {
         let pose = { x: self.position.x, y: self.position.y, theta: self.theta };
-        let cost = 0;
+        let cost = linear === 0 ? 1.5 : 0; // small standing-still discouragement
         for (let step = 1; step <= horizon; step += 1) {
           const previous = { x: pose.x, y: pose.y };
           pose.theta = normalizeAngle(pose.theta + angular * dt);
@@ -258,19 +266,13 @@ export class PredictiveMpcPolicy implements RobotPolicy {
           const targetDist = distance(p, routeTarget);
           cost += targetDist * targetDist * 2.0 + (linear * linear + angular * angular * 0.12) * 0.18;
 
-          if (!isCircleFree(p, self.radius + 0.12, observation.staticObstacles, observation.scenario)) {
+          if (!isCircleFree(p, self.radius + staticClearance, observation.staticObstacles, observation.scenario)) {
             cost = Number.POSITIVE_INFINITY;
             break;
           }
-          if (!isSegmentFree(previous, p, self.radius + 0.12, observation.staticObstacles, observation.scenario)) {
+          if (!isSegmentFree(previous, p, self.radius + staticClearance, observation.staticObstacles, observation.scenario)) {
             cost = Number.POSITIVE_INFINITY;
             break;
-          }
-          for (const rect of observation.staticObstacles) {
-            if (circleRectOverlap(p, self.radius + 0.12, rect)) {
-              cost = Number.POSITIVE_INFINITY;
-              break;
-            }
           }
           if (!Number.isFinite(cost)) break;
           for (const staff of observation.sensedStaff) {
@@ -280,18 +282,23 @@ export class PredictiveMpcPolicy implements RobotPolicy {
               y: staff.position.y + staffVelocity.y * dt * step,
             };
             const clearance = distance(p, predicted) - self.radius - staff.radius;
-            if (clearance < 0.85) cost += (0.85 - clearance) * (0.85 - clearance) * 800;
+            if (clearance < 0.85) cost += (0.85 - clearance) * (0.85 - clearance) * 600;
           }
+          // Only penalise rollout steps that move closer to a robot than we are now
           for (const robot of observation.sensedRobots) {
-            const clearance = distance(p, robot.position) - self.radius - robot.radius;
-            if (clearance < 0.45) cost += (0.45 - clearance) * (0.45 - clearance) * 800;
+            const currentClearance = distance(self.position, robot.position) - self.radius - robot.radius;
+            const futureClearance = distance(p, robot.position) - self.radius - robot.radius;
+            if (futureClearance < 0.55 && futureClearance < currentClearance) {
+              cost += (0.55 - futureClearance) * (0.55 - futureClearance) * 400;
+            }
           }
         }
         if (!best || cost < best.cost) best = { linear, angular, cost };
       }
     }
 
-    if (!best || best.cost > 10000) {
+    // Only fall back to CBF when every rollout is physically blocked by obstacles
+    if (!best || !Number.isFinite(best.cost)) {
       return new ControlBarrierPolicy().decide(observation);
     }
 

@@ -9,8 +9,8 @@ import './styles.css';
 const defaultConfig: SimulationConfig = {
   seed: 11,
   robotCount: 4,
-  staffCount: 5,
-  cartStaffCount: 2,
+  staffCount: 2,
+  cartStaffCount: 0,
   taskMeanInterval: 5,
   dt: 0.1,
 };
@@ -26,6 +26,21 @@ const defaultLayers: CanvasLayerSettings = {
   doors: true,
 };
 
+type TrialResult = {
+  seed: number;
+  score: number;
+  taskCost: number;
+  humanMultiplier: number;
+  completedTasks: number;
+  averageCompletionSeconds: number;
+  collisions: number;
+  collisionRobotStaff: number;
+  collisionRobotRobot: number;
+  collisionRobotWall: number;
+  nearMisses: number;
+  robotUtilization: number;
+};
+
 export default function App() {
   const [config, setConfig] = useState(defaultConfig);
   const [policyId, setPolicyId] = useState<RobotPolicyId>(defaultPolicyId);
@@ -34,6 +49,11 @@ export default function App() {
   const [replayIndex, setReplayIndex] = useState<number | null>(null);
   const [selectedRobotId, setSelectedRobotId] = useState('R1');
   const [layers, setLayers] = useState<CanvasLayerSettings>(defaultLayers);
+  const [trialCount, setTrialCount] = useState(10);
+  const [trialDuration, setTrialDuration] = useState(120);
+  const [trialResults, setTrialResults] = useState<TrialResult[]>([]);
+  const [trialProgress, setTrialProgress] = useState<{ current: number; total: number } | null>(null);
+  const trialAbortRef = useRef(false);
   const engineRef = useRef(new SimulationEngine(hospitalScenario, createRobotPolicy(defaultPolicyId), config));
   const [snapshot, setSnapshot] = useState<SimulationSnapshot>(() => engineRef.current.snapshot());
   const [history, setHistory] = useState<SimulationSnapshot[]>([snapshot]);
@@ -103,6 +123,46 @@ export default function App() {
 
   const toggleLayer = (key: keyof CanvasLayerSettings) => {
     setLayers((current) => ({ ...current, [key]: !current[key] }));
+  };
+
+  const runTrials = async () => {
+    if (trialProgress) return;
+    setRunning(false);
+    setTrialResults([]);
+    trialAbortRef.current = false;
+    setTrialProgress({ current: 0, total: trialCount });
+
+    const collected: TrialResult[] = [];
+    for (let i = 0; i < trialCount; i += 1) {
+      if (trialAbortRef.current) break;
+      const trialConfig: SimulationConfig = { ...config, seed: config.seed + i };
+      const engine = new SimulationEngine(hospitalScenario, createRobotPolicy(policyId), trialConfig);
+      const final = engine.runFor(trialDuration);
+      const m = final.metrics;
+      collected.push({
+        seed: trialConfig.seed,
+        score: m.score.score,
+        taskCost: m.score.taskCost,
+        humanMultiplier: m.score.humanMultiplier,
+        completedTasks: m.completedTasks,
+        averageCompletionSeconds: m.averageCompletionSeconds,
+        collisions: m.collisions,
+        collisionRobotStaff: m.collisionBreakdown.robotStaff,
+        collisionRobotRobot: m.collisionBreakdown.robotRobot,
+        collisionRobotWall: m.collisionBreakdown.robotWall,
+        nearMisses: m.nearMisses,
+        robotUtilization: m.robotUtilization,
+      });
+      setTrialProgress({ current: i + 1, total: trialCount });
+      setTrialResults([...collected]);
+      // Yield to the UI so the progress indicator updates between trials
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    setTrialProgress(null);
+  };
+
+  const cancelTrials = () => {
+    trialAbortRef.current = true;
   };
 
   return (
@@ -288,6 +348,50 @@ export default function App() {
             <Metric label="Robot Utilization" value={`${(selectedSnapshot.metrics.robotUtilization * 100).toFixed(0)}%`} />
           </div>
 
+          <div className="panel-card trial-sweep">
+            <h2>Trial Sweep</h2>
+            <p className="muted">
+              Runs N independent trials at seeds {config.seed}…{config.seed + trialCount - 1} with the
+              current policy and agent counts, then averages the metrics.
+            </p>
+            <div className="config-grid">
+              <label>
+                Trials
+                <input
+                  type="number"
+                  min="1"
+                  max="200"
+                  value={trialCount}
+                  onChange={(event) => setTrialCount(clampInteger(event.target.value, 1, 200))}
+                  disabled={trialProgress !== null}
+                />
+              </label>
+              <label>
+                Duration (s)
+                <input
+                  type="number"
+                  min="10"
+                  max="1800"
+                  value={trialDuration}
+                  onChange={(event) => setTrialDuration(clampInteger(event.target.value, 10, 1800))}
+                  disabled={trialProgress !== null}
+                />
+              </label>
+            </div>
+            <div className="button-row">
+              <button onClick={runTrials} disabled={trialProgress !== null}>
+                {trialProgress ? 'Running…' : 'Run Sweep'}
+              </button>
+              {trialProgress && <button onClick={cancelTrials}>Cancel</button>}
+            </div>
+            {trialProgress && (
+              <p>
+                Progress: {trialProgress.current} / {trialProgress.total}
+              </p>
+            )}
+            {trialResults.length > 0 && <TrialAggregate results={trialResults} />}
+          </div>
+
           <div className="panel-card queue">
             <h2>Task Queue</h2>
             {selectedSnapshot.tasks.filter((task) => task.status !== 'completed').slice(0, 7).map((task) => (
@@ -320,6 +424,48 @@ function Metric({ label, value }: { label: string; value: string }) {
     <div className="metric-row">
       <span>{label}</span>
       <strong>{value}</strong>
+    </div>
+  );
+}
+
+function meanStd(values: number[]): { mean: number; std: number } {
+  if (values.length === 0) return { mean: 0, std: 0 };
+  const mean = values.reduce((sum, v) => sum + v, 0) / values.length;
+  if (values.length === 1) return { mean, std: 0 };
+  const variance =
+    values.reduce((sum, v) => sum + (v - mean) * (v - mean), 0) / (values.length - 1);
+  return { mean, std: Math.sqrt(variance) };
+}
+
+function TrialAggregate({ results }: { results: TrialResult[] }) {
+  const fields: Array<{ label: string; pick: (r: TrialResult) => number; format: (v: number) => string }> = [
+    { label: 'Score S', pick: (r) => r.score, format: (v) => v.toFixed(3) },
+    { label: 'C_task', pick: (r) => r.taskCost, format: (v) => v.toFixed(3) },
+    { label: 'M_human', pick: (r) => r.humanMultiplier, format: (v) => `${v.toFixed(2)}x` },
+    { label: 'Completed', pick: (r) => r.completedTasks, format: (v) => v.toFixed(1) },
+    { label: 'Avg Completion (s)', pick: (r) => r.averageCompletionSeconds, format: (v) => v.toFixed(1) },
+    { label: 'Collisions', pick: (r) => r.collisions, format: (v) => v.toFixed(1) },
+    { label: 'Robot-Staff', pick: (r) => r.collisionRobotStaff, format: (v) => v.toFixed(1) },
+    { label: 'Robot-Robot', pick: (r) => r.collisionRobotRobot, format: (v) => v.toFixed(1) },
+    { label: 'Robot-Wall', pick: (r) => r.collisionRobotWall, format: (v) => v.toFixed(1) },
+    { label: 'Near Misses', pick: (r) => r.nearMisses, format: (v) => v.toFixed(1) },
+    { label: 'Utilization', pick: (r) => r.robotUtilization, format: (v) => `${(v * 100).toFixed(0)}%` },
+  ];
+  return (
+    <div className="trial-aggregate">
+      <h3>Averages over {results.length} trial{results.length === 1 ? '' : 's'}</h3>
+      {fields.map((field) => {
+        const stats = meanStd(results.map(field.pick));
+        return (
+          <div className="metric-row" key={field.label}>
+            <span>{field.label}</span>
+            <strong>
+              {field.format(stats.mean)}
+              {results.length > 1 && <span className="muted"> ± {field.format(stats.std)}</span>}
+            </strong>
+          </div>
+        );
+      })}
     </div>
   );
 }

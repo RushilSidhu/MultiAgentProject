@@ -51,8 +51,9 @@ type AgentCircle = {
   radius: number;
 };
 
-const STATIC_CLEARANCE_BUFFER = 0.08;
+const STATIC_CLEARANCE_BUFFER = 0.12;
 const AGENT_HARD_CLEARANCE_BUFFER = 0.04;
+const WALL_PUSHBACK_GAP = 0.06;
 
 export class SimulationEngine {
   private readonly rng: SeededRandom;
@@ -281,10 +282,28 @@ export class SimulationEngine {
     return Math.max(1, this.rng.range(this.config.taskMeanInterval * 0.45, this.config.taskMeanInterval * 1.55));
   }
 
+  private activeRoomIds(): Set<string> {
+    const busy = new Set<string>();
+    for (const task of this.tasks) {
+      if (task.status !== 'assigned' && task.status !== 'inService') continue;
+      busy.add(task.origin.roomId);
+      busy.add(task.destination.roomId);
+    }
+    return busy;
+  }
+
   private createTask(): void {
     const taskClass = this.rng.weighted(this.scenario.taskClasses, (item) => item.priority);
-    const origin = this.poiById(this.rng.pick(taskClass.originPoiIds));
-    const destination = this.poiById(this.rng.pick(taskClass.destinationPoiIds));
+    const busy = this.activeRoomIds();
+
+    const availableOriginIds = taskClass.originPoiIds.filter((id) => !busy.has(this.poiById(id).roomId));
+    const availableDestIds = taskClass.destinationPoiIds.filter((id) => !busy.has(this.poiById(id).roomId));
+    if (availableOriginIds.length === 0 || availableDestIds.length === 0) return;
+
+    const origin = this.poiById(this.rng.pick(availableOriginIds));
+    const destination = this.poiById(this.rng.pick(availableDestIds));
+    if (origin.roomId === destination.roomId) return;
+
     const task: TaskState = {
       id: `T${this.taskCounter++}`,
       classId: taskClass.id,
@@ -301,21 +320,42 @@ export class SimulationEngine {
   }
 
   private assignQueuedTasks(): void {
-    const queued = this.tasks
-      .filter((task) => task.status === 'queued' && !task.assignedRobotId)
-      .sort((a, b) => b.priority - a.priority || a.createdAt - b.createdAt);
-    for (const task of queued) {
-      const availableRobots = this.robots.filter(
+    const availableRobots = new Set(
+      this.robots.filter(
         (robot) => !robot.taskId && (robot.status === 'idle' || robot.status === 'returning'),
-      );
-      if (availableRobots.length === 0) return;
-      availableRobots.sort((a, b) => distance(a.position, task.origin.position) - distance(b.position, task.origin.position));
-      const robot = availableRobots[0];
-      robot.status = 'assigned';
-      robot.taskId = task.id;
-      task.status = 'assigned';
-      task.assignedRobotId = robot.id;
-      this.events.push({ time: this.time, kind: 'task-assigned', taskId: task.id, robotId: robot.id });
+      ),
+    );
+    if (availableRobots.size === 0) return;
+
+    const availableTasks = new Set(
+      this.tasks.filter((task) => task.status === 'queued' && !task.assignedRobotId),
+    );
+    if (availableTasks.size === 0) return;
+
+    while (availableRobots.size > 0 && availableTasks.size > 0) {
+      let bestRobot: RobotState | undefined;
+      let bestTask: TaskState | undefined;
+      let bestDist = Number.POSITIVE_INFINITY;
+      for (const robot of availableRobots) {
+        for (const task of availableTasks) {
+          const d = distance(robot.position, task.origin.position);
+          if (d < bestDist) {
+            bestDist = d;
+            bestRobot = robot;
+            bestTask = task;
+          }
+        }
+      }
+      if (!bestRobot || !bestTask) break;
+
+      bestRobot.status = 'assigned';
+      bestRobot.taskId = bestTask.id;
+      bestTask.status = 'assigned';
+      bestTask.assignedRobotId = bestRobot.id;
+      this.snapThetaToward(bestRobot, bestTask.origin.position);
+      this.events.push({ time: this.time, kind: 'task-assigned', taskId: bestTask.id, robotId: bestRobot.id });
+      availableRobots.delete(bestRobot);
+      availableTasks.delete(bestTask);
     }
     this.assertAssignmentIntegrity();
   }
@@ -619,6 +659,7 @@ export class SimulationEngine {
       if (this.isSweptOccupancyFree(robot.position, proposed, robot.radius, robot.id, obstacles)) {
         robot.theta = normalizeAngle(candidate.angle);
         robot.position = proposed;
+        this.pushAwayFromWalls(robot, obstacles);
         this.recordTrail(robot);
         return true;
       }
@@ -627,81 +668,164 @@ export class SimulationEngine {
     return false;
   }
 
-  private nearestRobotStaging(robot: RobotState): { label: string; position: Vec2 } | undefined {
-    const robotZones = this.scenario.spawnZones.filter((zone) => zone.agentKinds.includes('robot'));
-    if (robotZones.length === 0) return undefined;
+  private pushAwayFromWalls(robot: RobotState, obstacles: Rect[]): void {
+    for (const rect of obstacles) {
+      const closestX = clamp(robot.position.x, rect.x - rect.halfW, rect.x + rect.halfW);
+      const closestY = clamp(robot.position.y, rect.y - rect.halfH, rect.y + rect.halfH);
+      const dx = robot.position.x - closestX;
+      const dy = robot.position.y - closestY;
+      const d = Math.hypot(dx, dy);
+      if (d < 1e-4) continue;
+      const gap = d - robot.radius;
+      if (gap < WALL_PUSHBACK_GAP) {
+        const push = WALL_PUSHBACK_GAP - gap;
+        robot.position = {
+          x: robot.position.x + (dx / d) * push,
+          y: robot.position.y + (dy / d) * push,
+        };
+      }
+    }
+  }
 
+  private snapThetaToward(robot: RobotState, target: Vec2): void {
+    const obstacles = this.currentObstacles();
+    const route = navigationWaypoint(robot.position, target, robot.radius, obstacles, this.scenario, 0.06);
+    const dx = route.x - robot.position.x;
+    const dy = route.y - robot.position.y;
+    if (Math.hypot(dx, dy) > 1e-3) {
+      robot.theta = Math.atan2(dy, dx);
+    }
+  }
+
+  private hallwayZoneForRobot(robot: RobotState): (typeof this.scenario.spawnZones)[0] | undefined {
+    return this.scenario.spawnZones.find(
+      (zone) =>
+        zone.agentKinds.includes('robot') &&
+        Math.abs(robot.position.x - zone.x) <= zone.halfW &&
+        Math.abs(robot.position.y - zone.y) <= zone.halfH,
+    );
+  }
+
+  private shuffleInHallway(robot: RobotState, dt: number, obstacles: Rect[], zone: (typeof this.scenario.spawnZones)[0]): void {
+    robot.status = 'idle';
+    let steerX = 0;
+    let steerY = 0;
+
+    const addRepulsion = (pos: Vec2, radius: number, repelRadius: number, strength: number) => {
+      const dx = robot.position.x - pos.x;
+      const dy = robot.position.y - pos.y;
+      const d = Math.max(0.001, Math.hypot(dx, dy));
+      const gap = d - robot.radius - radius;
+      if (gap < repelRadius) {
+        const gain = (repelRadius - gap) / repelRadius;
+        steerX += (dx / d) * gain * strength;
+        steerY += (dy / d) * gain * strength;
+      }
+    };
+
+    for (const other of this.robots) {
+      if (other.id !== robot.id) addRepulsion(other.position, other.radius, 2.5, 1.0);
+    }
+    for (const person of this.staff) {
+      addRepulsion(person.position, person.radius, 2.0, 0.8);
+    }
+
+    // Gentle attractor toward zone centre so robots don't drift to the edges
+    const toCentreX = zone.x - robot.position.x;
+    const toCentreY = zone.y - robot.position.y;
+    const centreDist = Math.hypot(toCentreX, toCentreY);
+    if (centreDist > 0.5) {
+      const centreGain = Math.min(1.0, centreDist / (zone.halfW * 0.6)) * 0.35;
+      steerX += (toCentreX / centreDist) * centreGain;
+      steerY += (toCentreY / centreDist) * centreGain;
+    }
+
+    const mag = Math.hypot(steerX, steerY);
+    if (mag < 0.05) {
+      robot.diagnostics = {
+        updatedAt: this.time,
+        action: 'hold',
+        phase: 'idle',
+        note: 'Holding in hallway zone',
+        sensedStaffIds: [],
+        sensedRobotIds: [],
+        staffYieldRadius: 1.15,
+        nearMissRadius: 0.45,
+        linear: 0,
+        angular: 0,
+      };
+      return;
+    }
+
+    robot.theta = Math.atan2(steerY, steerX);
+    const speed = Math.min(robot.maxSpeed * 0.55, mag * 0.7);
+    const moved = this.tryMoveRobot(robot, speed * dt, obstacles);
+    robot.diagnostics = {
+      updatedAt: this.time,
+      action: moved ? 'velocity' : 'hold',
+      phase: 'idle',
+      note: 'Shuffling in hallway zone',
+      sensedStaffIds: this.staff.filter((p) => distance(p.position, robot.position) < 3).map((p) => p.id),
+      sensedRobotIds: this.robots
+        .filter((r) => r.id !== robot.id && distance(r.position, robot.position) < 3)
+        .map((r) => r.id),
+      staffYieldRadius: 1.15,
+      nearMissRadius: 0.45,
+      linear: moved ? speed : 0,
+      angular: 0,
+    };
+  }
+
+  private idleTarget(robot: RobotState): { label: string; position: Vec2 } {
+    const currentRoom = this.roomForPosition(robot.position);
+    if (currentRoom && currentRoom.kind !== 'corridor' && currentRoom.kind !== 'connector') {
+      const hallway1Y = 31;
+      const hallway2Y = 20;
+      const targetY =
+        Math.abs(robot.position.y - hallway1Y) < Math.abs(robot.position.y - hallway2Y)
+          ? hallway1Y
+          : hallway2Y;
+      return { label: 'hallway', position: { x: clamp(robot.position.x, 2, 58), y: targetY } };
+    }
+    const robotZones = this.scenario.spawnZones.filter((zone) => zone.agentKinds.includes('robot'));
+    if (robotZones.length === 0) return { label: 'hallway', position: { x: this.scenario.width / 2, y: this.scenario.height / 2 } };
     robotZones.sort(
       (a, b) =>
         distance(robot.position, { x: a.x, y: a.y }) -
-        distance(robot.position, {
-          x: b.x,
-          y: b.y,
-        }),
+        distance(robot.position, { x: b.x, y: b.y }),
     );
     const zone = robotZones[0];
     return { label: zone.label, position: { x: zone.x, y: zone.y } };
   }
 
   private updateRobotWithoutTask(robot: RobotState, dt: number, obstacles: Rect[]): void {
-    const staging = this.nearestRobotStaging(robot);
-    if (!staging) {
-      robot.status = 'idle';
-      robot.diagnostics = {
-        updatedAt: this.time,
-        action: 'hold',
-        phase: 'idle',
-        note: 'Idle with no robot staging zone configured',
-        sensedStaffIds: [],
-        sensedRobotIds: [],
-        staffYieldRadius: 1.15,
-        nearMissRadius: 0.45,
-        linear: 0,
-        angular: 0,
-      };
+    const zone = this.hallwayZoneForRobot(robot);
+    if (zone) {
+      this.shuffleInHallway(robot, dt, obstacles, zone);
       return;
     }
 
+    const staging = this.idleTarget(robot);
     const distToStaging = distance(robot.position, staging.position);
-    if (distToStaging < 0.55) {
-      robot.status = 'idle';
-      robot.diagnostics = {
-        updatedAt: this.time,
-        action: 'hold',
-        phase: 'idle',
-        note: `Idle at ${staging.label}`,
-        target: { ...staging.position },
-        targetLabel: staging.label,
-        sensedStaffIds: [],
-        sensedRobotIds: [],
-        staffYieldRadius: 1.15,
-        nearMissRadius: 0.45,
-        linear: 0,
-        angular: 0,
-      };
-      return;
-    }
 
-    const routeTarget = navigationWaypoint(robot.position, staging.position, robot.radius, obstacles, this.scenario, 0.12);
+    const routeTarget = navigationWaypoint(robot.position, staging.position, robot.radius, obstacles, this.scenario, 0.06);
     const desired = {
       x: routeTarget.x - robot.position.x,
       y: routeTarget.y - robot.position.y,
     };
     const desiredMag = Math.max(0.001, Math.hypot(desired.x, desired.y));
-    const avoid = steerAwayFromObstacles(robot.position, obstacles, 1.8);
-    const heading = Math.atan2(desired.y / desiredMag + avoid.y * 1.1, desired.x / desiredMag + avoid.x * 1.1);
-    const headingError = normalizeAngle(heading - robot.theta);
-    const angular = clamp(headingError * 2.2, -2.6, 2.6);
-    const linear = Math.min(robot.maxSpeed * 0.65, distToStaging / 2);
+    const avoid = steerAwayFromObstacles(robot.position, obstacles, 0.9);
+    const heading = Math.atan2(desired.y / desiredMag + avoid.y * 0.3, desired.x / desiredMag + avoid.x * 0.3);
 
     robot.status = 'returning';
-    robot.theta = normalizeAngle(robot.theta + angular * dt);
+    robot.theta = heading;
+    const linear = Math.min(robot.maxSpeed * 0.95, distToStaging / 1.5);
     const moved = this.tryMoveRobot(robot, linear * dt, obstacles);
     robot.diagnostics = {
       updatedAt: this.time,
       action: moved ? 'velocity' : 'hold',
       phase: 'idle',
-      note: moved ? `Returning to ${staging.label}` : `Waiting for a clear path to ${staging.label}`,
+      note: moved ? `Heading to ${staging.label}` : `Blocked en route to ${staging.label}`,
       target: { ...staging.position },
       targetLabel: staging.label,
       sensedStaffIds: [],
@@ -709,7 +833,7 @@ export class SimulationEngine {
       staffYieldRadius: 1.15,
       nearMissRadius: 0.45,
       linear: moved ? linear : 0,
-      angular: moved ? angular : 0,
+      angular: 0,
     };
   }
 
@@ -816,6 +940,7 @@ export class SimulationEngine {
         task.status = 'inService';
         task.serviceStartedAt = this.time;
         robot.status = 'servicing';
+        this.snapThetaToward(robot, task.destination.position);
       }
     }
   }
@@ -838,7 +963,7 @@ export class SimulationEngine {
         if (circleRectOverlap(robot.position, robot.radius, rect)) {
           this.collisionCount += 1;
           this.collisionBreakdown.robotWall += 1;
-          robot.status = 'down';
+          this.pushAwayFromWalls(robot, currentObstacles);
           this.events.push({ time: this.time, kind: 'collision', a: robot.id, b: rect.id, severity: 'collision' });
         }
       }
