@@ -5,6 +5,8 @@ import {
   distance,
   effectiveObstacles,
   isCircleFree,
+  isSegmentFree,
+  navigationWaypoint,
   normalizeAngle,
   steerAwayFromObstacles,
 } from './geometry';
@@ -49,7 +51,7 @@ type AgentCircle = {
   radius: number;
 };
 
-const STATIC_CLEARANCE_BUFFER = 0.02;
+const STATIC_CLEARANCE_BUFFER = 0.08;
 const AGENT_HARD_CLEARANCE_BUFFER = 0.04;
 
 export class SimulationEngine {
@@ -258,6 +260,23 @@ export class SimulationEngine {
     );
   }
 
+  private isSweptOccupancyFree(start: Vec2, end: Vec2, radius: number, selfId: string, obstacles: Rect[]): boolean {
+    return (
+      isSegmentFree(start, end, radius + STATIC_CLEARANCE_BUFFER, obstacles, this.scenario) &&
+      this.isClearOfAgents(end, radius, selfId, AGENT_HARD_CLEARANCE_BUFFER, start)
+    );
+  }
+
+  private staticClearance(center: Vec2, radius: number, obstacles: Rect[]): number {
+    let clearance = Math.min(center.x, center.y, this.scenario.width - center.x, this.scenario.height - center.y) - radius;
+    for (const rect of obstacles) {
+      const closestX = clamp(center.x, rect.x - rect.halfW, rect.x + rect.halfW);
+      const closestY = clamp(center.y, rect.y - rect.halfH, rect.y + rect.halfH);
+      clearance = Math.min(clearance, Math.hypot(center.x - closestX, center.y - closestY) - radius);
+    }
+    return clearance;
+  }
+
   private sampleTaskInterval(): number {
     return Math.max(1, this.rng.range(this.config.taskMeanInterval * 0.45, this.config.taskMeanInterval * 1.55));
   }
@@ -429,15 +448,17 @@ export class SimulationEngine {
   }
 
   private moveStaffTowardGoal(person: StaffState, dt: number, speedScale: number): boolean {
-    const toGoal = { x: person.goal.x - person.position.x, y: person.goal.y - person.position.y };
-    const distToGoal = Math.hypot(toGoal.x, toGoal.y);
-    if (distToGoal < 0.35) {
+    const distToFinalGoal = distance(person.position, person.goal);
+    if (distToFinalGoal < 0.35) {
       person.speed = 0;
       return true;
     }
 
-    const desired = { x: toGoal.x / distToGoal, y: toGoal.y / distToGoal };
     const currentObstacles = this.currentObstacles();
+    const routeGoal = navigationWaypoint(person.position, person.goal, person.radius, currentObstacles, this.scenario, person.hasCart ? 0.06 : 0.08);
+    const toGoal = { x: routeGoal.x - person.position.x, y: routeGoal.y - person.position.y };
+    const distToGoal = Math.max(0.001, Math.hypot(toGoal.x, toGoal.y));
+    const desired = { x: toGoal.x / distToGoal, y: toGoal.y / distToGoal };
     const obstacleAvoid = steerAwayFromObstacles(person.position, currentObstacles, 1.25);
     const neighborAvoid = this.staffNeighborAvoidance(person);
     const steer = {
@@ -446,15 +467,18 @@ export class SimulationEngine {
     };
     const steerMag = Math.max(0.001, Math.hypot(steer.x, steer.y));
     const theta = Math.atan2(steer.y / steerMag, steer.x / steerMag);
+    const previousTheta = person.theta;
     person.theta = theta;
     const roleSpeed = person.role === 'cart_nurse' ? 0.58 : person.role === 'charge_nurse' ? 0.72 : 0.78;
-    person.speed = roleSpeed * speedScale;
+    const turnSlowdown = Math.max(0.45, Math.cos(normalizeAngle(theta - previousTheta)));
+    const waypointSlowdown = distToGoal < 0.9 ? Math.max(0.35, distToGoal / 0.9) : 1;
+    person.speed = roleSpeed * speedScale * turnSlowdown * waypointSlowdown;
 
     const proposed = {
       x: person.position.x + Math.cos(theta) * person.speed * dt,
       y: person.position.y + Math.sin(theta) * person.speed * dt,
     };
-    if (this.isOccupancyFree(proposed, person.radius, person.id, currentObstacles, person.position)) {
+    if (this.isSweptOccupancyFree(person.position, proposed, person.radius, person.id, currentObstacles)) {
       person.position = proposed;
       this.recordTrail(person);
       return false;
@@ -470,7 +494,7 @@ export class SimulationEngine {
         x: person.position.x + Math.cos(angle) * person.speed * dt * 0.7,
         y: person.position.y + Math.sin(angle) * person.speed * dt * 0.7,
       };
-      if (this.isOccupancyFree(candidate, person.radius, person.id, currentObstacles, person.position)) {
+      if (this.isSweptOccupancyFree(person.position, candidate, person.radius, person.id, currentObstacles)) {
         person.theta = angle;
         person.position = candidate;
         this.recordTrail(person);
@@ -569,6 +593,7 @@ export class SimulationEngine {
     if (stepDistance <= 1e-5) return true;
 
     const forward = robot.theta;
+    const currentClearance = this.staticClearance(robot.position, robot.radius, obstacles);
     const candidates = [
       { angle: forward, scale: 1 },
       { angle: forward, scale: 0.7 },
@@ -588,7 +613,10 @@ export class SimulationEngine {
         x: robot.position.x + Math.cos(candidate.angle) * distanceForCandidate,
         y: robot.position.y + Math.sin(candidate.angle) * distanceForCandidate,
       };
-      if (this.isOccupancyFree(proposed, robot.radius, robot.id, obstacles, robot.position)) {
+      if (candidate.angle !== forward && this.staticClearance(proposed, robot.radius, obstacles) + 0.01 < currentClearance) {
+        continue;
+      }
+      if (this.isSweptOccupancyFree(robot.position, proposed, robot.radius, robot.id, obstacles)) {
         robot.theta = normalizeAngle(candidate.angle);
         robot.position = proposed;
         this.recordTrail(robot);
@@ -654,9 +682,10 @@ export class SimulationEngine {
       return;
     }
 
+    const routeTarget = navigationWaypoint(robot.position, staging.position, robot.radius, obstacles, this.scenario, 0.12);
     const desired = {
-      x: staging.position.x - robot.position.x,
-      y: staging.position.y - robot.position.y,
+      x: routeTarget.x - robot.position.x,
+      y: routeTarget.y - robot.position.y,
     };
     const desiredMag = Math.max(0.001, Math.hypot(desired.x, desired.y));
     const avoid = steerAwayFromObstacles(robot.position, obstacles, 1.8);

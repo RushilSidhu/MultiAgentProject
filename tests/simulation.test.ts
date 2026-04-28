@@ -95,6 +95,55 @@ const testScenario = (options: {
   };
 };
 
+const doorwayScenario = (options: {
+  robotSpawn?: { x: number; y: number };
+  staffSpawn?: { x: number; y: number };
+}): Scenario => {
+  const wallWest: Rect = { id: 'cross-wall-west', kind: 'wall', x: 1.45, y: 4, halfW: 1.45, halfH: 0.12 };
+  const wallEast: Rect = { id: 'cross-wall-east', kind: 'wall', x: 6.55, y: 4, halfW: 1.45, halfH: 0.12 };
+  return {
+    id: 'doorway-routing-regression',
+    name: 'Doorway Routing Regression',
+    width: 8,
+    height: 8,
+    rooms: [
+      { id: 'south-room', name: 'South Room', kind: 'corridor', x: 4, y: 2, w: 8, h: 3.75 },
+      { id: 'north-room', name: 'North Room', kind: 'corridor', x: 4, y: 6, w: 8, h: 3.75 },
+    ],
+    obstacles: [wallWest, wallEast],
+    doors: [
+      {
+        id: 'cross-wall-door',
+        label: 'Cross Wall Door',
+        roomId: 'north-room',
+        panel: { id: 'cross-wall-door-panel', kind: 'wall', x: 4, y: 4, halfW: 0.75, halfH: 0.12 },
+        triggerRadius: 1.8,
+      },
+    ],
+    pois: [
+      { id: 'pickup', label: 'pickup', roomId: 'north-room', position: { x: 2, y: 6.2 }, taskTarget: true, staffStop: false },
+      { id: 'dropoff', label: 'dropoff', roomId: 'north-room', position: { x: 2.5, y: 6.2 }, taskTarget: true, staffStop: false },
+      { id: 'south-stop', label: 'south-stop', roomId: 'south-room', position: { x: 2, y: 2 }, taskTarget: false, staffStop: true },
+      { id: 'north-stop', label: 'north-stop', roomId: 'north-room', position: { x: 2, y: 6.2 }, taskTarget: false, staffStop: true },
+    ],
+    spawnZones: [
+      ...(options.robotSpawn ? [exactSpawn('robot-spawn', options.robotSpawn.x, options.robotSpawn.y, ['robot'])] : []),
+      ...(options.staffSpawn ? [exactSpawn('staff-spawn', options.staffSpawn.x, options.staffSpawn.y, ['staff'])] : []),
+    ],
+    taskClasses: [
+      {
+        id: 'doorway-task',
+        label: 'Doorway Task',
+        priority: 1,
+        serviceSeconds: 1,
+        deadlineSeconds: 60,
+        originPoiIds: ['pickup'],
+        destinationPoiIds: ['dropoff'],
+      },
+    ],
+  };
+};
+
 const eastCommandPolicy: RobotPolicy = {
   id: 'east-command',
   label: 'East Command',
@@ -283,6 +332,44 @@ describe('simulation engine', () => {
     expect(snapshot.metrics.collisionBreakdown.robotWall).toBe(0);
     expect(robot.status).not.toBe('down');
     expect(Math.abs(robot.position.y - 3)).toBeGreaterThan(0.05);
+  });
+
+  it('routes robots through a doorway instead of driving into an interior wall', () => {
+    const engine = new SimulationEngine(doorwayScenario({ robotSpawn: { x: 2, y: 2 } }), new VisualDemoPolicy(), {
+      seed: 13,
+      robotCount: 1,
+      staffCount: 0,
+      cartStaffCount: 0,
+      taskMeanInterval: 1,
+      dt: 0.1,
+    });
+
+    const snapshot = engine.runFor(16);
+    const robot = snapshot.robots[0];
+
+    expect(snapshot.metrics.collisionBreakdown.robotWall).toBe(0);
+    expect(robot.status).not.toBe('down');
+    expect(robot.position.y).toBeGreaterThan(4.5);
+  });
+
+  it('routes nurses through a doorway instead of stepping into an interior wall', () => {
+    const scenario = doorwayScenario({ staffSpawn: { x: 2, y: 2 } });
+    const engine = new SimulationEngine(scenario, new VisualDemoPolicy(), {
+      seed: 21,
+      robotCount: 0,
+      staffCount: 1,
+      cartStaffCount: 0,
+      taskMeanInterval: 60,
+      dt: 0.1,
+    });
+
+    const snapshot = engine.runFor(12);
+    const nurse = snapshot.staff[0];
+
+    expect(nurse.position.y).toBeGreaterThan(4.5);
+    for (const wall of scenario.obstacles) {
+      expect(circleRectOverlap(nurse.position, nurse.radius, wall)).toBe(false);
+    }
   });
 });
 
