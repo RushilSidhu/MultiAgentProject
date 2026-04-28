@@ -230,22 +230,20 @@ classdef HospitalEnv < handle
                 return;
             end
 
-            % -- Lidar hit dots (reuse handles; update X/Y only) -------
+            % -- Lidar rays (reuse handles; update X/Y only) -----------
             for i = 1:numel(obj.Robots)
                 r = obj.Robots(i);
                 if isempty(r.LidarAngles)
                     continue;
                 end
-                [xDots, yDots] = obj.packLidarHitDots(r);
+                [xRays, yRays] = obj.packLidarHitSegments(r);
                 if i <= numel(obj.hLidar) && isvalid(obj.hLidar(i))
-                    set(obj.hLidar(i), 'XData', xDots, 'YData', yDots, ...
+                    set(obj.hLidar(i), 'XData', xRays, 'YData', yRays, ...
                         'Visible', obj.boolToOnOff(obj.LidarVisible));
                 else
-                    obj.hLidar(i) = line(obj.Ax, xDots, yDots, ...
-                        'LineStyle', 'none', ...
-                        'Marker', '.', ...
-                        'MarkerSize', 7, ...
-                        'Color', [0.22 0.95 0.28], ...
+                    obj.hLidar(i) = line(obj.Ax, xRays, yRays, ...
+                        'Color', [0.35 0.85 0.35], ...
+                        'LineWidth', 0.35, ...
                         'Visible', obj.boolToOnOff(obj.LidarVisible));
                 end
             end
@@ -1021,26 +1019,24 @@ classdef HospitalEnv < handle
         end
 
         % ============================================================== %
-        function [xDots, yDots] = packLidarHitDots(~, robot)
+        function [xRays, yRays] = packLidarHitSegments(~, robot)
             n = numel(robot.LidarRanges);
-            xDots = nan(1, n);
-            yDots = nan(1, n);
+            xRays = nan(1, 3*n);
+            yRays = nan(1, 3*n);
             if n == 0
                 return;
             end
 
-            epsTol = 1e-3;
-            hitMask = robot.LidarRanges < (robot.MaxRange - epsTol);
-            if ~any(hitMask)
-                return;
-            end
-
             worldAngles = robot.LidarAngles + robot.Theta;
-            hitX = robot.X + robot.LidarRanges .* cos(worldAngles);
-            hitY = robot.Y + robot.LidarRanges .* sin(worldAngles);
+            endX = robot.X + robot.LidarRanges .* cos(worldAngles);
+            endY = robot.Y + robot.LidarRanges .* sin(worldAngles);
 
-            xDots(hitMask) = hitX(hitMask);
-            yDots(hitMask) = hitY(hitMask);
+            idx0 = 1:3:(3*n);
+            idx1 = 2:3:(3*n);
+            xRays(idx0) = robot.X;
+            xRays(idx1) = endX;
+            yRays(idx0) = robot.Y;
+            yRays(idx1) = endY;
         end
 
         % ============================================================== %
