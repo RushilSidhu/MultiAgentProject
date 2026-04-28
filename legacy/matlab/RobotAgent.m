@@ -70,6 +70,16 @@ classdef RobotAgent < handle
         ReplanInterval (1,1) double = 0.7
         WaypointTolerance (1,1) double = 0.55
         NurseSafetyMargin (1,1) double = 0.95
+        NurseYieldStartDist (1,1) double = 2.0
+        NurseYieldStopDist  (1,1) double = 1.05
+        MaxYieldHoldTime    (1,1) double = 0.9
+        YieldHoldTime       (1,1) double = 0.0
+        PrevFrontRange      (1,1) double = NaN
+        ExternalHoldUntil   (1,1) double = -Inf
+        LastProgressDistance (1,1) double = Inf
+        LastProgressTime    (1,1) double = 0
+        ReverseUntil        (1,1) double = -Inf
+        DeadlockBoostUntil  (1,1) double = -Inf
     end
 
     % ------------------------------------------------------------------ %
@@ -102,6 +112,10 @@ classdef RobotAgent < handle
             obj.TargetX       = NaN;
             obj.TargetY       = NaN;
             obj.CurrentTaskID = -1;
+            obj.LastProgressDistance = Inf;
+            obj.ReverseUntil = -Inf;
+            obj.DeadlockBoostUntil = -Inf;
+            obj.ExternalHoldUntil = -Inf;
             if ~strcmp(obj.Status, 'out_of_operation')
                 obj.Status = 'idle';
             end
@@ -116,6 +130,36 @@ classdef RobotAgent < handle
 
         function tf = isOperational(obj)
             tf = ~strcmp(obj.Status, 'out_of_operation');
+        end
+
+        function state = getDebugState(obj)
+            % Compact label of the dominant runtime constraint, used by
+            % HospitalEnv to render an above-chassis status badge.
+            if ~obj.isOperational()
+                state = 'down';
+                return;
+            end
+            if obj.SimTimeCache < obj.ReverseUntil
+                state = 'reversing';
+                return;
+            end
+            if obj.SimTimeCache < obj.ExternalHoldUntil
+                state = 'holding';
+                return;
+            end
+            if obj.YieldHoldTime > 0
+                state = 'yielding';
+                return;
+            end
+            if obj.SimTimeCache < obj.DeadlockBoostUntil
+                state = 'boosted';
+                return;
+            end
+            if strcmp(obj.Status, 'idle')
+                state = 'idle';
+                return;
+            end
+            state = 'cruising';
         end
 
         function setControlMode(obj, mode)
@@ -147,11 +191,32 @@ classdef RobotAgent < handle
             if isfield(cfg, 'nurseSafetyMargin')
                 obj.NurseSafetyMargin = cfg.nurseSafetyMargin;
             end
+            if isfield(cfg, 'nurseYieldStartDist')
+                obj.NurseYieldStartDist = cfg.nurseYieldStartDist;
+            end
+            if isfield(cfg, 'nurseYieldStopDist')
+                obj.NurseYieldStopDist = cfg.nurseYieldStopDist;
+            end
+            if isfield(cfg, 'maxYieldHoldTime')
+                obj.MaxYieldHoldTime = cfg.maxYieldHoldTime;
+            end
         end
 
         function updatePlanningContext(obj, simTime, dt)
             obj.SimTimeCache = simTime;
             obj.DtCache = dt;
+        end
+
+        function setExternalHoldUntil(obj, holdUntil)
+            obj.ExternalHoldUntil = max(obj.ExternalHoldUntil, holdUntil);
+        end
+
+        function requestDeadlockRecovery(obj, boostDuration)
+            if nargin < 2 || isempty(boostDuration)
+                boostDuration = 0.5;
+            end
+            obj.DeadlockBoostUntil = max(obj.DeadlockBoostUntil, obj.SimTimeCache + boostDuration);
+            obj.ReverseUntil = max(obj.ReverseUntil, obj.SimTimeCache + 0.35);
         end
 
         % ============================================================== %
@@ -238,6 +303,12 @@ classdef RobotAgent < handle
                 v = 0; omega = 0;
                 obj.PlannedWaypoints = zeros(0,2);
                 obj.WaypointIndex = 1;
+                obj.LastProgressDistance = Inf;
+                return;
+            end
+
+            if obj.SimTimeCache < obj.ExternalHoldUntil
+                v = 0; omega = 0;
                 return;
             end
 
@@ -264,6 +335,7 @@ classdef RobotAgent < handle
             dx = wx - obj.X;
             dy = wy - obj.Y;
             distWp = norm([dx, dy]);
+            goalDist = norm([target_x - obj.X, target_y - obj.Y]);
             if distWp < obj.WaypointTolerance
                 obj.WaypointIndex = obj.WaypointIndex + 1;
                 [wx, wy, hasWp] = obj.getCurrentWaypoint(target_x, target_y);
@@ -306,6 +378,14 @@ classdef RobotAgent < handle
                 end
             end
 
+            if goalDist + 0.03 < obj.LastProgressDistance
+                obj.LastProgressDistance = goalDist;
+                obj.LastProgressTime = obj.SimTimeCache;
+            elseif (obj.SimTimeCache - obj.LastProgressTime) > 1.2
+                obj.requestDeadlockRecovery(0.6);
+                obj.LastProgressTime = obj.SimTimeCache;
+            end
+
             switch obj.ControlMode
                 case 'conservative_speed'
                     Kp_omega = 1.8;
@@ -322,6 +402,23 @@ classdef RobotAgent < handle
             distGain = min(1.0, distWp / 1.8);
             v = obj.MaxLinSpeed * speedScale * alignFactor * distGain;
             omega = Kp_omega * headingErr;
+
+            [yieldScale, mustHold] = obj.assessNurseYield(lidar_data);
+            if mustHold
+                v = 0;
+                omega = 0;
+            else
+                v = v * yieldScale;
+            end
+
+            [v, omega] = obj.applyReciprocalAvoidance(v, omega, headingErr, lidar_data);
+
+            if obj.SimTimeCache < obj.ReverseUntil
+                v = -0.18;
+                omega = 0;
+            elseif obj.SimTimeCache < obj.DeadlockBoostUntil
+                v = min(obj.MaxLinSpeed, v * 1.12);
+            end
 
             omega = max(-obj.MaxAngSpeed, min(obj.MaxAngSpeed, omega));
             if v <= 1e-3
@@ -411,6 +508,83 @@ classdef RobotAgent < handle
             frontClear = min(rngs(frontMask));
             blocked = frontClear < obj.NurseSafetyMargin;
             canRetryPlan = blocked && ((obj.SimTimeCache - obj.LastPlanTime) >= obj.ReplanInterval);
+        end
+
+        function [yieldScale, mustHold] = assessNurseYield(obj, lidarData)
+            % Balanced nurse-priority yielding using only local lidar cues.
+            ang = lidarData.angles;
+            rngs = lidarData.ranges;
+            frontMask = abs(ang) <= deg2rad(28);
+            crossingMask = abs(ang) > deg2rad(18) & abs(ang) <= deg2rad(45);
+
+            frontR = min(rngs(frontMask));
+            crossR = min(rngs(crossingMask));
+            if isempty(frontR) || ~isfinite(frontR)
+                frontR = obj.MaxRange;
+            end
+            if isempty(crossR) || ~isfinite(crossR)
+                crossR = obj.MaxRange;
+            end
+
+            closingRate = 0;
+            if isfinite(obj.PrevFrontRange) && obj.DtCache > 1e-6
+                closingRate = (obj.PrevFrontRange - frontR) / obj.DtCache;
+            end
+            obj.PrevFrontRange = frontR;
+
+            mustHold = false;
+            if frontR <= obj.NurseYieldStopDist || ...
+                    (frontR <= obj.NurseYieldStartDist && crossR <= obj.NurseYieldStartDist && closingRate > 0.2)
+                obj.YieldHoldTime = obj.MaxYieldHoldTime;
+            else
+                obj.YieldHoldTime = max(0, obj.YieldHoldTime - obj.DtCache);
+            end
+            if obj.YieldHoldTime > 0
+                mustHold = true;
+                yieldScale = 0;
+                return;
+            end
+
+            if frontR <= obj.NurseYieldStopDist
+                yieldScale = 0;
+                mustHold = true;
+                return;
+            end
+            if frontR >= obj.NurseYieldStartDist
+                yieldScale = 1.0;
+            else
+                span = max(1e-6, obj.NurseYieldStartDist - obj.NurseYieldStopDist);
+                alpha = (frontR - obj.NurseYieldStopDist) / span;
+                yieldScale = max(0.2, min(1.0, alpha));
+            end
+            if crossR < obj.NurseYieldStartDist
+                yieldScale = min(yieldScale, 0.55);
+            end
+        end
+
+        function [vOut, omegaOut] = applyReciprocalAvoidance(obj, vIn, omegaIn, headingErr, lidarData)
+            % Lightweight reciprocal-avoidance proxy from local scan sectors.
+            ang = lidarData.angles;
+            rngs = lidarData.ranges;
+            leftMask = ang > deg2rad(12) & ang <= deg2rad(65);
+            rightMask = ang < -deg2rad(12) & ang >= -deg2rad(65);
+            frontMask = abs(ang) <= deg2rad(22);
+            leftClear = min(rngs(leftMask));
+            rightClear = min(rngs(rightMask));
+            frontClear = min(rngs(frontMask));
+            if isempty(leftClear) || ~isfinite(leftClear), leftClear = obj.MaxRange; end
+            if isempty(rightClear) || ~isfinite(rightClear), rightClear = obj.MaxRange; end
+            if isempty(frontClear) || ~isfinite(frontClear), frontClear = obj.MaxRange; end
+
+            sideBias = max(-1.0, min(1.0, (leftClear - rightClear) / max(obj.MaxRange, 1e-6)));
+            omegaBias = -0.55 * sideBias;
+            slowScale = min(1.0, max(0.18, frontClear / max(1.6, obj.NurseSafetyMargin + 0.5)));
+            if abs(headingErr) < deg2rad(25)
+                vOut = vIn * slowScale;
+            else
+                vOut = vIn * min(1.0, slowScale + 0.15);
+            end
+            omegaOut = omegaIn + omegaBias;
         end
 
         function [waypoints, ok] = aStarPath(obj, startXY, goalXY)

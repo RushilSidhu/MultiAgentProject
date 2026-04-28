@@ -1,5 +1,8 @@
 # Hospital Multi-Agent Simulation — Architecture Reference
 
+> Legacy note: the MATLAB implementation is archived in `legacy/matlab/`.
+> Active development now targets the TypeScript model under `src/`.
+
 A fully object-oriented, handle-class MATLAB simulation shell for a 2-D
 top-down hospital environment. Designed as a clean boilerplate layer so you
 can drop in your own game-theory path-planning algorithms without touching
@@ -11,11 +14,11 @@ any simulation infrastructure.
 
 | File | Role |
 |---|---|
-| `main.m` | Entry-point. Configuration lives here. |
-| `HospitalEnv.m` | 60×40 m ward (20 rooms, 2 hallways, vertical connector), walls, POIs, renderer, collision, metrics. |
-| `RobotAgent.m` | Unicycle-model robot with 2-D Lidar sensor and pluggable controller. |
-| `NurseAgent.m` | Waypoint / random walk (plain nurse or nurse+cart); optional semantic `Waypoints` from env. |
-| `TaskDispatcher.m` | Normally-distributed task spawner with optional batch arrivals. |
+| `legacy/matlab/main.m` | Legacy entry-point. Configuration lived here. |
+| `legacy/matlab/HospitalEnv.m` | Legacy 60×40 m ward, walls, POIs, renderer, collision, metrics. |
+| `legacy/matlab/RobotAgent.m` | Legacy unicycle-model robot with 2-D Lidar sensor and pluggable controller. |
+| `legacy/matlab/NurseAgent.m` | Legacy waypoint/random-walk nurse behavior implementation. |
+| `legacy/matlab/TaskDispatcher.m` | Legacy task spawner with optional batch arrivals. |
 
 ---
 
