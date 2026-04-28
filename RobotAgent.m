@@ -26,7 +26,7 @@ classdef RobotAgent < handle
         TargetY       (1,1) double = NaN
         CurrentTaskID (1,1) double = -1
 
-        % Robot status  'idle' | 'busy' | 'error'
+        % Robot status  'idle' | 'busy' | 'error' | 'out_of_operation'
         Status (1,:) char = 'idle'
         ControlMode (1,:) char = 'default'
 
@@ -52,6 +52,24 @@ classdef RobotAgent < handle
 
         % Optional debug logging (disabled by default for runtime performance)
         DebugEnabled (1,1) logical = false
+
+        % Global planning state (known static geometry + path cursor)
+        KnownMapWidth  (1,1) double = NaN
+        KnownMapHeight (1,1) double = NaN
+        KnownObstacles (:,4) double = zeros(0,4)
+        HasKnownMap (1,1) logical = false
+        PlannedWaypoints (:,2) double = zeros(0,2)
+        WaypointIndex (1,1) double = 1
+        LastPlannedTarget (1,2) double = [NaN NaN]
+        LastPlanTime (1,1) double = -Inf
+        SimTimeCache (1,1) double = 0
+        DtCache (1,1) double = 0.1
+
+        % Planner tuning
+        GridResolution (1,1) double = 0.6
+        ReplanInterval (1,1) double = 0.7
+        WaypointTolerance (1,1) double = 0.55
+        NurseSafetyMargin (1,1) double = 0.95
     end
 
     % ------------------------------------------------------------------ %
@@ -84,7 +102,20 @@ classdef RobotAgent < handle
             obj.TargetX       = NaN;
             obj.TargetY       = NaN;
             obj.CurrentTaskID = -1;
-            obj.Status        = 'idle';
+            if ~strcmp(obj.Status, 'out_of_operation')
+                obj.Status = 'idle';
+            end
+        end
+
+        function retire(obj)
+            obj.clearTarget();
+            obj.Status = 'out_of_operation';
+            obj.LastV = 0;
+            obj.LastOmega = 0;
+        end
+
+        function tf = isOperational(obj)
+            tf = ~strcmp(obj.Status, 'out_of_operation');
         end
 
         function setControlMode(obj, mode)
@@ -94,6 +125,33 @@ classdef RobotAgent < handle
                     'Unsupported control mode: %s', mode);
             end
             obj.ControlMode = mode;
+        end
+
+        function setStaticMap(obj, mapData)
+            obj.KnownMapWidth = mapData.width;
+            obj.KnownMapHeight = mapData.height;
+            obj.KnownObstacles = mapData.obstacles;
+            obj.HasKnownMap = true;
+        end
+
+        function configurePlanner(obj, cfg)
+            if isfield(cfg, 'gridResolution')
+                obj.GridResolution = cfg.gridResolution;
+            end
+            if isfield(cfg, 'replanInterval')
+                obj.ReplanInterval = cfg.replanInterval;
+            end
+            if isfield(cfg, 'waypointTolerance')
+                obj.WaypointTolerance = cfg.waypointTolerance;
+            end
+            if isfield(cfg, 'nurseSafetyMargin')
+                obj.NurseSafetyMargin = cfg.nurseSafetyMargin;
+            end
+        end
+
+        function updatePlanningContext(obj, simTime, dt)
+            obj.SimTimeCache = simTime;
+            obj.DtCache = dt;
         end
 
         % ============================================================== %
@@ -171,54 +229,115 @@ classdef RobotAgent < handle
             %   v      linear velocity  [m/s]
             %   omega  angular velocity [rad/s]
 
-            if isnan(target_x) || isnan(target_y)
+            if ~obj.isOperational()
                 v = 0; omega = 0;
                 return;
             end
 
-            % Bearing to target in world frame
-            dx = target_x - obj.X;
-            dy = target_y - obj.Y;
-            targetAngle = atan2(dy, dx);
-
-            % Heading error (wrapped to [-pi, pi])
-            headingErr = wrapToPi(targetAngle - obj.Theta);
-
-            % Mode-specific gains / speed policy.
-            nearObstacle = min(lidar_data.ranges) < 1.2;
-            switch obj.ControlMode
-                case 'conservative_speed'
-                    Kp_omega = 2.2;
-                    speedScale = 0.65;
-                    if nearObstacle
-                        speedScale = 0.35;
-                    end
-                case 'aggressive_speed'
-                    Kp_omega = 3.0;
-                    speedScale = 1.0;
-                    if nearObstacle
-                        speedScale = 0.85;
-                    end
-                otherwise
-                    Kp_omega = 2.0;
-                    speedScale = 1.0;
-                    if nearObstacle
-                        speedScale = 0.75;
-                    end
+            if isnan(target_x) || isnan(target_y)
+                v = 0; omega = 0;
+                obj.PlannedWaypoints = zeros(0,2);
+                obj.WaypointIndex = 1;
+                return;
             end
 
-            omega = Kp_omega * headingErr;
-            omega = max(-obj.MaxAngSpeed, min(obj.MaxAngSpeed, omega));
+            if obj.HasKnownMap
+                mustReplan = obj.needsReplan(target_x, target_y);
+                if mustReplan
+                    ok = obj.planPathToTarget(target_x, target_y);
+                    if ~ok
+                        v = 0; omega = 0;
+                        return;
+                    end
+                end
+            else
+                obj.PlannedWaypoints = [target_x, target_y];
+                obj.WaypointIndex = 1;
+            end
 
-            % Drive forward only when roughly aligned (reduces arc overshoots)
-            alignFactor = max(0, cos(headingErr));
-            dist = norm([dx, dy]);
-            v = obj.MaxLinSpeed * speedScale * alignFactor * min(1, dist / 2.0);
+            [wx, wy, hasWp] = obj.getCurrentWaypoint(target_x, target_y);
+            if ~hasWp
+                v = 0; omega = 0;
+                return;
+            end
+
+            dx = wx - obj.X;
+            dy = wy - obj.Y;
+            distWp = norm([dx, dy]);
+            if distWp < obj.WaypointTolerance
+                obj.WaypointIndex = obj.WaypointIndex + 1;
+                [wx, wy, hasWp] = obj.getCurrentWaypoint(target_x, target_y);
+                if ~hasWp
+                    v = 0; omega = 0;
+                    return;
+                end
+                dx = wx - obj.X;
+                dy = wy - obj.Y;
+                distWp = norm([dx, dy]);
+            end
+
+            targetAngle = atan2(dy, dx);
+            headingErr = wrapToPi(targetAngle - obj.Theta);
+
+            [isBlocked, canRetryPlan] = obj.checkLocalBlockage(lidar_data);
+            if isBlocked
+                if canRetryPlan
+                    ok = obj.planPathToTarget(target_x, target_y);
+                    if ok
+                        [wx2, wy2, hasWp2] = obj.getCurrentWaypoint(target_x, target_y);
+                        if hasWp2
+                            dx = wx2 - obj.X;
+                            dy = wy2 - obj.Y;
+                            targetAngle = atan2(dy, dx);
+                            headingErr = wrapToPi(targetAngle - obj.Theta);
+                            [isBlocked2, ~] = obj.checkLocalBlockage(lidar_data);
+                            if isBlocked2
+                                v = 0; omega = 0;
+                                return;
+                            end
+                        end
+                    else
+                        v = 0; omega = 0;
+                        return;
+                    end
+                else
+                    v = 0; omega = 0;
+                    return;
+                end
+            end
+
+            switch obj.ControlMode
+                case 'conservative_speed'
+                    Kp_omega = 1.8;
+                    speedScale = 0.6;
+                case 'aggressive_speed'
+                    Kp_omega = 2.4;
+                    speedScale = 0.95;
+                otherwise
+                    Kp_omega = 2.0;
+                    speedScale = 0.8;
+            end
+
+            alignFactor = max(0.25, cos(headingErr));
+            distGain = min(1.0, distWp / 1.8);
+            v = obj.MaxLinSpeed * speedScale * alignFactor * distGain;
+            omega = Kp_omega * headingErr;
+
+            omega = max(-obj.MaxAngSpeed, min(obj.MaxAngSpeed, omega));
+            if v <= 1e-3
+                % No point turns unless coupled with forward movement.
+                omega = 0;
+            end
         end
 
         % ============================================================== %
         function move(obj, v, omega, dt, obstacles, worldW, worldH)
             % move  Integrate unicycle kinematics; enforce world bounds.
+            if ~obj.isOperational()
+                obj.LastV = 0;
+                obj.LastOmega = 0;
+                return;
+            end
             [v, omega] = obj.applyCommandSmoothing(v, omega, dt);
 
             % Unicycle integration
@@ -253,6 +372,169 @@ classdef RobotAgent < handle
 
     % ------------------------------------------------------------------ %
     methods (Access = private)
+
+        function tf = needsReplan(obj, targetX, targetY)
+            targetChanged = any(abs([targetX, targetY] - obj.LastPlannedTarget) > 0.25);
+            pathMissing = isempty(obj.PlannedWaypoints) || obj.WaypointIndex > size(obj.PlannedWaypoints,1);
+            stale = (obj.SimTimeCache - obj.LastPlanTime) >= obj.ReplanInterval;
+            tf = targetChanged || pathMissing || stale;
+        end
+
+        function ok = planPathToTarget(obj, targetX, targetY)
+            [path, ok] = obj.aStarPath([obj.X, obj.Y], [targetX, targetY]);
+            if ok
+                obj.PlannedWaypoints = path;
+                obj.WaypointIndex = 1;
+                obj.LastPlannedTarget = [targetX, targetY];
+                obj.LastPlanTime = obj.SimTimeCache;
+            else
+                obj.PlannedWaypoints = zeros(0,2);
+                obj.WaypointIndex = 1;
+            end
+        end
+
+        function [wx, wy, ok] = getCurrentWaypoint(obj, targetX, targetY)
+            if isempty(obj.PlannedWaypoints)
+                wx = targetX; wy = targetY; ok = true;
+                return;
+            end
+            idx = min(obj.WaypointIndex, size(obj.PlannedWaypoints,1));
+            wx = obj.PlannedWaypoints(idx,1);
+            wy = obj.PlannedWaypoints(idx,2);
+            ok = true;
+        end
+
+        function [blocked, canRetryPlan] = checkLocalBlockage(obj, lidarData)
+            ang = lidarData.angles;
+            rngs = lidarData.ranges;
+            frontMask = abs(ang) <= deg2rad(25);
+            frontClear = min(rngs(frontMask));
+            blocked = frontClear < obj.NurseSafetyMargin;
+            canRetryPlan = blocked && ((obj.SimTimeCache - obj.LastPlanTime) >= obj.ReplanInterval);
+        end
+
+        function [waypoints, ok] = aStarPath(obj, startXY, goalXY)
+            % Grid-based A* over known static map.
+            if ~obj.HasKnownMap
+                waypoints = goalXY;
+                ok = true;
+                return;
+            end
+
+            res = obj.GridResolution;
+            W = obj.KnownMapWidth;
+            H = obj.KnownMapHeight;
+            nx = max(2, floor(W / res) + 1);
+            ny = max(2, floor(H / res) + 1);
+
+            occ = false(ny, nx);
+            inflate = obj.Radius + 0.12;
+            [Xg, Yg] = meshgrid(0:(nx-1), 0:(ny-1));
+            worldX = Xg * res;
+            worldY = Yg * res;
+            for k = 1:size(obj.KnownObstacles,1)
+                o = obj.KnownObstacles(k,:);
+                occ = occ | obj.gridCircleAABBOverlap(worldX, worldY, inflate, o);
+            end
+
+            [sx, sy] = obj.worldToGrid(startXY(1), startXY(2), res, nx, ny);
+            [gx, gy] = obj.worldToGrid(goalXY(1), goalXY(2), res, nx, ny);
+            if occ(sy, sx) || occ(gy, gx)
+                waypoints = zeros(0,2);
+                ok = false;
+                return;
+            end
+
+            nNodes = nx * ny;
+            startIdx = sub2ind([ny, nx], sy, sx);
+            goalIdx  = sub2ind([ny, nx], gy, gx);
+            open = false(nNodes,1);
+            closed = false(nNodes,1);
+            gScore = inf(nNodes,1);
+            fScore = inf(nNodes,1);
+            cameFrom = zeros(nNodes,1);
+
+            gScore(startIdx) = 0;
+            fScore(startIdx) = hypot(gx-sx, gy-sy);
+            open(startIdx) = true;
+
+            neigh = [-1 -1; -1 0; -1 1; 0 -1; 0 1; 1 -1; 1 0; 1 1];
+            while any(open)
+                openIdx = find(open);
+                [~, m] = min(fScore(openIdx));
+                cur = openIdx(m);
+                if cur == goalIdx
+                    break;
+                end
+                open(cur) = false;
+                closed(cur) = true;
+                [cy, cx] = ind2sub([ny, nx], cur);
+
+                for ni = 1:size(neigh,1)
+                    nxCell = cx + neigh(ni,1);
+                    nyCell = cy + neigh(ni,2);
+                    if nxCell < 1 || nxCell > nx || nyCell < 1 || nyCell > ny
+                        continue;
+                    end
+                    if occ(nyCell, nxCell)
+                        continue;
+                    end
+                    nIdx = sub2ind([ny, nx], nyCell, nxCell);
+                    if closed(nIdx)
+                        continue;
+                    end
+                    stepCost = hypot(neigh(ni,1), neigh(ni,2));
+                    tentative = gScore(cur) + stepCost;
+                    if tentative < gScore(nIdx)
+                        cameFrom(nIdx) = cur;
+                        gScore(nIdx) = tentative;
+                        fScore(nIdx) = tentative + hypot(gx - nxCell, gy - nyCell);
+                        open(nIdx) = true;
+                    end
+                end
+            end
+
+            if ~isfinite(gScore(goalIdx))
+                waypoints = zeros(0,2);
+                ok = false;
+                return;
+            end
+
+            chain = goalIdx;
+            while chain(1) ~= startIdx
+                prev = cameFrom(chain(1));
+                if prev == 0
+                    waypoints = zeros(0,2);
+                    ok = false;
+                    return;
+                end
+                chain = [prev; chain]; %#ok<AGROW>
+            end
+
+            waypoints = zeros(numel(chain), 2);
+            for ii = 1:numel(chain)
+                [gyi, gxi] = ind2sub([ny, nx], chain(ii));
+                waypoints(ii,:) = [(gxi-1) * res, (gyi-1) * res];
+            end
+            waypoints(end,:) = goalXY;
+            ok = true;
+        end
+
+        function [gx, gy] = worldToGrid(~, x, y, res, nx, ny)
+            gx = min(nx, max(1, round(x / res) + 1));
+            gy = min(ny, max(1, round(y / res) + 1));
+        end
+
+        function tf = gridCircleAABBOverlap(~, x, y, r, aabb)
+            dx = abs(x - aabb(1));
+            dy = abs(y - aabb(2));
+            hw = aabb(3);
+            hh = aabb(4);
+            tf = ~(dx > hw + r | dy > hh + r);
+            inside = (dx <= hw | dy <= hh);
+            corner = (dx - hw).^2 + (dy - hh).^2 <= r^2;
+            tf = tf & (inside | corner);
+        end
 
         % ============================================================== %
         function [vCmd, omegaCmd] = applyCommandSmoothing(obj, vTarget, omegaTarget, dt)

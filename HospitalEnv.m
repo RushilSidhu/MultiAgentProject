@@ -105,6 +105,7 @@ classdef HospitalEnv < handle
 
         % ============================================================== %
         function addRobot(obj, robot)
+            robot.setStaticMap(obj.getStaticMapData());
             obj.Robots(end+1,1) = robot;
         end
 
@@ -153,7 +154,12 @@ classdef HospitalEnv < handle
 
             % 2. Build combined obstacle list for Lidar (walls + nurses + other robots)
             for i = 1:numel(obj.Robots)
+                if ~obj.Robots(i).isOperational()
+                    continue;
+                end
+                obj.Robots(i).updatePlanningContext(obj.SimTime, dt);
                 otherRobots = obj.Robots([1:i-1, i+1:end]);
+                otherRobots = otherRobots(arrayfun(@(r) r.isOperational(), otherRobots));
                 lidarData   = obj.Robots(i).senseEnvironment(...
                     obj.Obstacles, obj.Nurses, otherRobots);
 
@@ -171,6 +177,50 @@ classdef HospitalEnv < handle
 
             % 5. Reassign queued tasks if robots became idle
             obj.reassignQueuedTasks();
+        end
+
+        function tf = allRobotsOutOfOperation(obj)
+            if isempty(obj.Robots)
+                tf = true;
+                return;
+            end
+            tf = ~any(arrayfun(@(r) r.isOperational(), obj.Robots));
+        end
+
+        function mapData = getStaticMapData(obj)
+            % getStaticMapData  Known static geometry for global planners.
+            mapData = struct( ...
+                'width', obj.Width, ...
+                'height', obj.Height, ...
+                'obstacles', obj.Obstacles);
+        end
+
+        function tf = isStaticSegmentTraversable(obj, p0, p1, radius, sampleStep)
+            % Query static traversability against known walls/doors geometry.
+            if nargin < 5 || isempty(sampleStep)
+                sampleStep = 0.2;
+            end
+            if nargin < 4 || isempty(radius)
+                radius = 0.4;
+            end
+            seg = p1 - p0;
+            segLen = norm(seg);
+            if segLen < 1e-9
+                tf = ~obj.positionInObstacle(p0(1), p0(2), radius);
+                return;
+            end
+            n = max(2, ceil(segLen / sampleStep) + 1);
+            ts = linspace(0, 1, n);
+            tf = true;
+            for ii = 1:numel(ts)
+                p = p0 + ts(ii) * seg;
+                if p(1) < radius || p(1) > obj.Width - radius || ...
+                        p(2) < radius || p(2) > obj.Height - radius || ...
+                        obj.positionInObstacle(p(1), p(2), radius)
+                    tf = false;
+                    return;
+                end
+            end
         end
 
         % ============================================================== %
@@ -668,7 +718,7 @@ classdef HospitalEnv < handle
 
         % ============================================================== %
         function detectCollisions(obj)
-            % Entity-entity collisions
+            % Robot-involved collisions are terminal for the robot.
             nRobots = numel(obj.Robots);
             nNurses = numel(obj.Nurses);
 
@@ -677,39 +727,35 @@ classdef HospitalEnv < handle
                 for j = i+1:nRobots
                     ri = obj.Robots(i);
                     rj = obj.Robots(j);
+                    if ~ri.isOperational() || ~rj.isOperational()
+                        continue;
+                    end
                     dist = norm([ri.X-rj.X, ri.Y-rj.Y]);
                     if dist < (ri.Radius + rj.Radius)
                         obj.TotalCollisions = obj.TotalCollisions + 1;
-                        fprintf('[COLLISION %.2fs] Entity %s vs %s  dist=%.3f\n',...
-                            obj.SimTime, class(ri), class(rj), dist);
-                    end
-                end
-            end
-
-            % Nurse-nurse
-            for i = 1:nNurses-1
-                for j = i+1:nNurses
-                    ni = obj.Nurses(i);
-                    nj = obj.Nurses(j);
-                    dist = norm([ni.X-nj.X, ni.Y-nj.Y]);
-                    if dist < (ni.Radius + nj.Radius)
-                        obj.TotalCollisions = obj.TotalCollisions + 1;
-                        fprintf('[COLLISION %.2fs] Entity %s vs %s  dist=%.3f\n',...
-                            obj.SimTime, class(ni), class(nj), dist);
+                        fprintf('[COLLISION %.2fs] Robot %d vs Robot %d  dist=%.3f -> both out of operation\n',...
+                            obj.SimTime, i, j, dist);
+                        obj.retireRobot(i, sprintf('Robot collision with Robot %d', j));
+                        obj.retireRobot(j, sprintf('Robot collision with Robot %d', i));
                     end
                 end
             end
 
             % Robot-nurse
             for i = 1:nRobots
+                if ~obj.Robots(i).isOperational()
+                    continue;
+                end
                 for j = 1:nNurses
                     r = obj.Robots(i);
                     n = obj.Nurses(j);
                     dist = norm([r.X-n.X, r.Y-n.Y]);
                     if dist < (r.Radius + n.Radius)
                         obj.TotalCollisions = obj.TotalCollisions + 1;
-                        fprintf('[COLLISION %.2fs] Entity %s vs %s  dist=%.3f\n',...
-                            obj.SimTime, class(r), class(n), dist);
+                        fprintf('[COLLISION %.2fs] Robot %d vs Nurse %d  dist=%.3f -> robot out of operation\n',...
+                            obj.SimTime, i, j, dist);
+                        obj.retireRobot(i, sprintf('Collision with Nurse %d', j));
+                        break;
                     end
                 end
             end
@@ -717,22 +763,16 @@ classdef HospitalEnv < handle
             % Entity-wall (AABB) collisions
             for i = 1:nRobots
                 e = obj.Robots(i);
-                for w = 1:size(obj.Obstacles,1)
-                    if obj.circleAABBOverlap(e.X, e.Y, e.Radius, obj.Obstacles(w,:))
-                        obj.TotalCollisions = obj.TotalCollisions + 1;
-                        fprintf('[COLLISION %.2fs] %s #%d hit wall #%d\n',...
-                            obj.SimTime, class(e), i, w);
-                    end
+                if ~e.isOperational()
+                    continue;
                 end
-            end
-
-            for i = 1:nNurses
-                e = obj.Nurses(i);
                 for w = 1:size(obj.Obstacles,1)
                     if obj.circleAABBOverlap(e.X, e.Y, e.Radius, obj.Obstacles(w,:))
                         obj.TotalCollisions = obj.TotalCollisions + 1;
-                        fprintf('[COLLISION %.2fs] %s #%d hit wall #%d\n',...
-                            obj.SimTime, class(e), i, w);
+                        fprintf('[COLLISION %.2fs] Robot %d hit obstacle %d -> out of operation\n',...
+                            obj.SimTime, i, w);
+                        obj.retireRobot(i, sprintf('Collision with obstacle %d', w));
+                        break;
                     end
                 end
             end
@@ -843,6 +883,7 @@ classdef HospitalEnv < handle
                 case 'idle',  c = [0.95 0.85 0.25];
                 case 'busy',  c = [0.28 0.92 0.45];
                 case 'error', c = [0.96 0.24 0.24];
+                case 'out_of_operation', c = [0.36 0.36 0.40];
                 otherwise,    c = [0.72 0.72 0.72];
             end
         end
@@ -988,6 +1029,30 @@ classdef HospitalEnv < handle
                         norm([obj.Robots(i).X - tx, obj.Robots(i).Y - ty]), idleIdx);
                     [~, minI] = min(dists);
                     chosen = idleIdx(minI);
+            end
+        end
+
+        function retireRobot(obj, robotIdx, reason)
+            r = obj.Robots(robotIdx);
+            if ~r.isOperational()
+                return;
+            end
+            taskId = r.CurrentTaskID;
+            r.retire();
+            fprintf('[ROBOT DOWN %.2fs] Robot %d retired (%s)\n', ...
+                obj.SimTime, robotIdx, reason);
+
+            if taskId < 0
+                return;
+            end
+
+            for ti = 1:numel(obj.Tasks)
+                if obj.Tasks(ti).id == taskId
+                    obj.Tasks(ti).assignedTo = -1;
+                    fprintf('[TASK REQUEUE %.2fs] Task %d returned to queue (Robot %d unavailable)\n', ...
+                        obj.SimTime, taskId, robotIdx);
+                    break;
+                end
             end
         end
     end
